@@ -1,0 +1,26 @@
+flowchart TD
+  A([Start]) --> B[Upload: PDF + Doc]
+  B --> C[Parse & Store Inputs]
+  C --> D[Randomly Sample 10 Sets]
+  D --> F[Display 10 Sets to User]
+
+
+  F --> G[Loop Counter = 1]
+
+  G --> H[User Selects / Accepts Results]
+  H --> I[Record Feedback (Accepted/Rejected + Optional Notes)]
+  I --> J[Analyze Feedback to Update User Profile]
+
+  J --> K[Generate Recommendations Based on Updated Profile]
+  K --> L[Show Recommendations to User]
+
+
+  L --> M[Loop Counter = Loop Counter + 1]
+
+  M --> N{Loop Counter <= 3?}
+
+
+  N -- Yes --> Go back to G
+  N -- No --> Z([End])
+
+  
