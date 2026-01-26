@@ -199,19 +199,24 @@ app.post('/api/projects/:projectId/upload', upload.array('files'), async (req, r
 // Get random sample for initial round
 app.post('/api/projects/:projectId/random-sample', (req, res) => {
   const { projectId } = req.params;
-  const houses = db.prepare('SELECT * FROM houses WHERE project_id = ?').all(projectId);
 
-  // Randomly select up to 10 houses
-  const shuffled = houses.sort(() => 0.5 - Math.random());
-  const selected = shuffled.slice(0, Math.min(10, houses.length));
+  // Get all houses not yet recommended in any round
+  const recommendedHouseIds = db.prepare('SELECT house_id FROM recommendations WHERE project_id = ?')
+    .all(projectId)
+    .map(r => r.house_id);
+
+  const availableHouses = db.prepare('SELECT * FROM houses WHERE project_id = ?')
+    .all(projectId)
+    .filter(h => !recommendedHouseIds.includes(h.id));
+
+  // Randomly select up to 10 houses from available ones
+  const shuffled = availableHouses.sort(() => 0.5 - Math.random());
+  const selected = shuffled.slice(0, Math.min(10, availableHouses.length));
 
   // Create recommendation entries for round 0
   for (const house of selected) {
-    const existing = db.prepare('SELECT * FROM recommendations WHERE project_id = ? AND house_id = ? AND round = 0').get(projectId, house.id);
-    if (!existing) {
-      db.prepare('INSERT INTO recommendations (id, project_id, house_id, round) VALUES (?, ?, ?, 0)')
-        .run(uuidv4(), projectId, house.id);
-    }
+    db.prepare('INSERT INTO recommendations (id, project_id, house_id, round) VALUES (?, ?, ?, 0)')
+      .run(uuidv4(), projectId, house.id);
   }
 
   res.json({ houses: selected });
