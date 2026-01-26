@@ -106,6 +106,20 @@ function HomePage() {
     return '完了'
   }
 
+  const deleteProject = async (e: React.MouseEvent, projectId: string, projectName: string) => {
+    e.stopPropagation()
+    if (!confirm(`「${projectName}」を削除しますか？\nこの操作は取り消せません。`)) {
+      return
+    }
+    try {
+      await axios.delete(`/api/projects/${projectId}`)
+      setProjects(projects.filter(p => p.id !== projectId))
+    } catch (err) {
+      console.error('Failed to delete project:', err)
+      alert('プロジェクトの削除に失敗しました')
+    }
+  }
+
   return (
     <>
       <header className="header">
@@ -212,14 +226,31 @@ function HomePage() {
                       {formatDate(project.created_at)}
                     </div>
                   </div>
-                  <div style={{
-                    padding: '4px 12px',
-                    background: '#f0f3ff',
-                    borderRadius: '20px',
-                    fontSize: '0.85rem',
-                    color: '#667eea'
-                  }}>
-                    {getRoundLabel(project.current_round)}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    <div style={{
+                      padding: '4px 12px',
+                      background: '#f0f3ff',
+                      borderRadius: '20px',
+                      fontSize: '0.85rem',
+                      color: '#667eea'
+                    }}>
+                      {getRoundLabel(project.current_round)}
+                    </div>
+                    <button
+                      onClick={(e) => deleteProject(e, project.id, project.name)}
+                      style={{
+                        padding: '6px 10px',
+                        background: '#fee2e2',
+                        border: 'none',
+                        borderRadius: '6px',
+                        color: '#dc2626',
+                        cursor: 'pointer',
+                        fontSize: '0.85rem'
+                      }}
+                      title="削除"
+                    >
+                      🗑️
+                    </button>
                   </div>
                 </li>
               ))}

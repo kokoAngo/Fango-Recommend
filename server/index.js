@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from 'uuid';
 import OpenAI from 'openai';
 import pdfParse from 'pdf-parse';
 import archiver from 'archiver';
+import { PDFDocument } from 'pdf-lib';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,9 +18,13 @@ const app = express();
 const PORT = 3002;
 
 // OpenAI configuration
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
+const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
+
+if (!openai) {
+  console.warn('Warning: OPENAI_API_KEY not set. AI features will be disabled.');
+}
 
 // Middleware
 app.use(cors());
@@ -118,7 +123,7 @@ app.get('/api/projects/:projectId', (req, res) => {
   res.json({ ...project, houses, recommendations });
 });
 
-// Upload files to project
+// Upload files to project - splits multi-page PDFs into single pages
 app.post('/api/projects/:projectId/upload', upload.array('files'), async (req, res) => {
   const { projectId } = req.params;
   const files = req.files;
@@ -130,40 +135,65 @@ app.post('/api/projects/:projectId/upload', upload.array('files'), async (req, r
   }
 
   const houseIds = [];
+  const uploadDir = path.join(__dirname, 'uploads', projectId);
 
   for (const file of files) {
     if (file.mimetype === 'application/pdf') {
-      const houseId = uuidv4();
       const filePath = file.path;
 
-      // Parse PDF content
-      let content = '';
       try {
-        const stats = fs.statSync(filePath);
-        const fileSizeMB = stats.size / (1024 * 1024);
+        // Load the PDF
+        const pdfBytes = fs.readFileSync(filePath);
+        const pdfDoc = await PDFDocument.load(pdfBytes);
+        const pageCount = pdfDoc.getPageCount();
 
-        // Skip parsing for very large files (> 50MB)
-        if (fileSizeMB > 50) {
-          console.log(`Skipping PDF parsing for large file (${fileSizeMB.toFixed(1)}MB): ${file.filename}`);
-          content = '[大きなPDFファイル - テキスト抽出スキップ]';
-        } else {
-          const dataBuffer = fs.readFileSync(filePath);
-          const pdfData = await pdfParse(dataBuffer);
-          content = pdfData.text;
+        console.log(`Splitting PDF: ${file.filename} (${pageCount} pages)`);
+
+        // Split each page into a separate PDF
+        for (let i = 0; i < pageCount; i++) {
+          const houseId = uuidv4();
+          const newPdfDoc = await PDFDocument.create();
+          const [copiedPage] = await newPdfDoc.copyPages(pdfDoc, [i]);
+          newPdfDoc.addPage(copiedPage);
+
+          // Save single page PDF
+          const pageFilename = `page_${i + 1}_${file.filename}`;
+          const pagePath = path.join(uploadDir, pageFilename);
+          const newPdfBytes = await newPdfDoc.save();
+          fs.writeFileSync(pagePath, newPdfBytes);
+
+          // Parse text content from single page
+          let content = '';
+          try {
+            const pageData = await pdfParse(Buffer.from(newPdfBytes));
+            content = pageData.text;
+          } catch (parseErr) {
+            console.error(`PDF parse error for page ${i + 1}:`, parseErr.message);
+            content = '[PDFの解析に失敗しました]';
+          }
+
+          // Save to database
+          db.prepare('INSERT INTO houses (id, project_id, filename, content) VALUES (?, ?, ?, ?)')
+            .run(houseId, projectId, pageFilename, content);
+
+          houseIds.push(houseId);
         }
+
+        // Delete original multi-page PDF
+        fs.unlinkSync(filePath);
+
       } catch (err) {
-        console.error('PDF parse error:', err.message);
-        content = '[PDFの解析に失敗しました]';
+        console.error('PDF split error:', err.message);
+        // Fallback: save original file as single house
+        const houseId = uuidv4();
+        db.prepare('INSERT INTO houses (id, project_id, filename, content) VALUES (?, ?, ?, ?)')
+          .run(houseId, projectId, file.filename, '[PDFの分割に失敗しました]');
+        houseIds.push(houseId);
       }
-
-      db.prepare('INSERT INTO houses (id, project_id, filename, content) VALUES (?, ?, ?, ?)')
-        .run(houseId, projectId, file.filename, content);
-
-      houseIds.push(houseId);
     }
   }
 
-  res.json({ success: true, houseIds });
+  res.json({ success: true, houseIds, pageCount: houseIds.length });
 });
 
 // Get random sample for initial round
@@ -206,6 +236,9 @@ app.post('/api/projects/:projectId/rate', async (req, res) => {
 
 // GPT Agent: Analyze user profile based on feedback
 async function analyzeUserProfile(projectId) {
+  if (!openai) {
+    throw new Error('OpenAI API key not configured');
+  }
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
   const recommendations = db.prepare(`
     SELECT r.*, h.content, h.filename
@@ -248,6 +281,9 @@ async function analyzeUserProfile(projectId) {
 
 // GPT Agent: Generate recommendations
 async function generateRecommendations(projectId, round) {
+  if (!openai) {
+    throw new Error('OpenAI API key not configured');
+  }
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
 
   // Get all houses not yet recommended
