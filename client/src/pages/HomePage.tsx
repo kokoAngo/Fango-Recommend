@@ -17,6 +17,7 @@ function HomePage() {
   const [loading, setLoading] = useState(false)
   const [dragover, setDragover] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const folderInputRef = useRef<HTMLInputElement>(null)
   const navigate = useNavigate()
 
   useEffect(() => {
@@ -32,9 +33,16 @@ function HomePage() {
     }
   }
 
+  const filterValidFiles = (fileList: File[]) => {
+    return fileList.filter(file =>
+      file.name.endsWith('.pdf') || file.name.endsWith('.txt')
+    )
+  }
+
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
-      setFiles(Array.from(e.target.files))
+      const validFiles = filterValidFiles(Array.from(e.target.files))
+      setFiles(prev => [...prev, ...validFiles])
     }
   }
 
@@ -42,7 +50,8 @@ function HomePage() {
     e.preventDefault()
     setDragover(false)
     if (e.dataTransfer.files) {
-      setFiles(Array.from(e.dataTransfer.files))
+      const validFiles = filterValidFiles(Array.from(e.dataTransfer.files))
+      setFiles(prev => [...prev, ...validFiles])
     }
   }
 
@@ -56,7 +65,8 @@ function HomePage() {
   }
 
   const startNewProject = async () => {
-    if (files.length === 0) {
+    const pdfFiles = files.filter(f => f.name.endsWith('.pdf'))
+    if (pdfFiles.length === 0) {
       alert('PDFファイルをアップロードしてください')
       return
     }
@@ -148,35 +158,84 @@ function HomePage() {
 
           <div
             className={`upload-area ${dragover ? 'dragover' : ''}`}
-            onClick={() => fileInputRef.current?.click()}
             onDrop={handleDrop}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
           >
             <div className="upload-icon">📁</div>
-            <p>PDFファイルをドラッグ＆ドロップ</p>
-            <p style={{ fontSize: '0.9rem', color: '#888' }}>
-              またはクリックしてファイルを選択
+            <p>PDF・TXTファイルをドラッグ＆ドロップ</p>
+            <p style={{ fontSize: '0.9rem', color: '#888', marginBottom: '15px' }}>
+              または下のボタンからアップロード
             </p>
+            <div style={{ display: 'flex', gap: '10px', justifyContent: 'center' }}>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                style={{ fontSize: '0.85rem' }}
+                onClick={(e) => { e.stopPropagation(); folderInputRef.current?.click() }}
+              >
+                📂 フォルダを選択
+              </button>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                style={{ fontSize: '0.85rem' }}
+                onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click() }}
+              >
+                📄 ファイルを選択
+              </button>
+            </div>
             <input
               ref={fileInputRef}
               type="file"
               multiple
-              accept=".pdf"
+              accept=".pdf,.txt"
+              style={{ display: 'none' }}
+              onChange={handleFileSelect}
+            />
+            <input
+              ref={folderInputRef}
+              type="file"
+              // @ts-ignore
+              webkitdirectory=""
               style={{ display: 'none' }}
               onChange={handleFileSelect}
             />
           </div>
 
           {files.length > 0 && (
-            <ul className="file-list">
-              {files.map((file, idx) => (
-                <li key={idx} className="file-item">
-                  <span className="file-icon">📄</span>
-                  {file.name}
-                </li>
-              ))}
-            </ul>
+            <>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '15px' }}>
+                <span style={{ fontSize: '0.9rem', color: '#666' }}>
+                  PDF: {files.filter(f => f.name.endsWith('.pdf')).length}件 /
+                  TXT: {files.filter(f => f.name.endsWith('.txt')).length}件
+                </span>
+                <button
+                  type="button"
+                  style={{ background: 'none', border: 'none', color: '#dc2626', cursor: 'pointer', fontSize: '0.85rem' }}
+                  onClick={() => setFiles([])}
+                >
+                  すべてクリア
+                </button>
+              </div>
+              <ul className="file-list">
+                {files.map((file, idx) => (
+                  <li key={idx} className="file-item" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <span className="file-icon">{file.name.endsWith('.pdf') ? '📄' : '📝'}</span>
+                      {file.name}
+                    </div>
+                    <button
+                      type="button"
+                      style={{ background: 'none', border: 'none', color: '#999', cursor: 'pointer', padding: '2px 6px' }}
+                      onClick={() => setFiles(files.filter((_, i) => i !== idx))}
+                    >
+                      ✕
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </>
           )}
 
           <div className="form-group" style={{ marginTop: '20px' }}>

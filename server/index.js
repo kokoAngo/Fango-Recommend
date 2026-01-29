@@ -10,6 +10,7 @@ import OpenAI from 'openai';
 import pdfParse from 'pdf-parse';
 import archiver from 'archiver';
 import { PDFDocument } from 'pdf-lib';
+import FormData from 'form-data';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,6 +26,10 @@ const openai = process.env.OPENAI_API_KEY
 if (!openai) {
   console.warn('Warning: OPENAI_API_KEY not set. AI features will be disabled.');
 }
+
+// Vector server configuration
+const VECTOR_SERVER = process.env.VECTOR_SERVER || 'https://greasier-grossly-betty.ngrok-free.dev';
+console.log(`Vector server: ${VECTOR_SERVER}`);
 
 // Middleware
 app.use(cors());
@@ -123,15 +128,33 @@ app.get('/api/projects/:projectId', (req, res) => {
   res.json({ ...project, houses, recommendations });
 });
 
-// Upload files to project - splits multi-page PDFs into single pages
+// Upload files to project - sends PDF to vector server and uses returned page_ids
 app.post('/api/projects/:projectId/upload', upload.array('files'), async (req, res) => {
   const { projectId } = req.params;
   const files = req.files;
   const { requirements } = req.body;
 
-  // Update project requirements if provided
-  if (requirements) {
-    db.prepare('UPDATE projects SET user_requirements = ? WHERE id = ?').run(requirements, projectId);
+  // Collect all requirements (from form + TXT files)
+  let allRequirements = requirements || '';
+
+  // Process TXT files first to collect requirements
+  for (const file of files) {
+    if (file.mimetype === 'text/plain' || file.originalname.endsWith('.txt')) {
+      try {
+        const txtContent = fs.readFileSync(file.path, 'utf-8');
+        allRequirements += (allRequirements ? '\n\n' : '') + `【${file.originalname}】\n${txtContent}`;
+        // Delete TXT file after reading
+        fs.unlinkSync(file.path);
+        console.log(`Read TXT file: ${file.originalname}`);
+      } catch (err) {
+        console.error('TXT read error:', err.message);
+      }
+    }
+  }
+
+  // Update project requirements if any
+  if (allRequirements) {
+    db.prepare('UPDATE projects SET user_requirements = ? WHERE id = ?').run(allRequirements, projectId);
   }
 
   const houseIds = [];
@@ -142,53 +165,116 @@ app.post('/api/projects/:projectId/upload', upload.array('files'), async (req, r
       const filePath = file.path;
 
       try {
-        // Load the PDF
+        // Send PDF to vector server first
+        console.log(`Sending PDF to vector server: ${file.filename}`);
+        const formData = new FormData();
+        formData.append('file', fs.createReadStream(filePath), file.filename);
+        formData.append('metadata', JSON.stringify({ project_id: projectId }));
+        formData.append('build_immediately', 'true');
+
+        const vectorResponse = await fetch(`${VECTOR_SERVER}/api/v1/pdf/process`, {
+          method: 'POST',
+          body: formData,
+          headers: formData.getHeaders()
+        });
+
+        if (!vectorResponse.ok) {
+          const errorText = await vectorResponse.text();
+          throw new Error(`Vector server error: ${vectorResponse.status} - ${errorText}`);
+        }
+
+        const vectorResult = await vectorResponse.json();
+        console.log(`Vector server processed ${vectorResult.processed_pages} pages, page_ids:`, vectorResult.page_ids);
+
+        // Now split PDF locally and use vector server's page_ids
         const pdfBytes = fs.readFileSync(filePath);
         const pdfDoc = await PDFDocument.load(pdfBytes);
         const pageCount = pdfDoc.getPageCount();
 
-        console.log(`Splitting PDF: ${file.filename} (${pageCount} pages)`);
+        console.log(`Splitting PDF locally: ${file.filename} (${pageCount} pages)`);
 
-        // Split each page into a separate PDF
+        // Match pages with vector server's page_ids
         for (let i = 0; i < pageCount; i++) {
-          const houseId = uuidv4();
+          // Use vector server's page_id if available, otherwise generate locally
+          const houseId = vectorResult.page_ids?.[i] || uuidv4();
+
           const newPdfDoc = await PDFDocument.create();
           const [copiedPage] = await newPdfDoc.copyPages(pdfDoc, [i]);
           newPdfDoc.addPage(copiedPage);
 
-          // Save single page PDF
+          // Save single page PDF locally
           const pageFilename = `page_${i + 1}_${file.filename}`;
           const pagePath = path.join(uploadDir, pageFilename);
           const newPdfBytes = await newPdfDoc.save();
           fs.writeFileSync(pagePath, newPdfBytes);
 
-          // Parse text content from single page
+          // Get content from vector server response or parse locally
           let content = '';
-          try {
-            const pageData = await pdfParse(Buffer.from(newPdfBytes));
-            content = pageData.text;
-          } catch (parseErr) {
-            console.error(`PDF parse error for page ${i + 1}:`, parseErr.message);
-            content = '[PDFの解析に失敗しました]';
+          const pageInfo = vectorResult.pages?.find(p => p.page_number === i + 1);
+          if (pageInfo) {
+            content = `[Vector server processed] Keywords: ${pageInfo.keywords?.join(', ') || 'none'}`;
+          } else {
+            try {
+              const pageData = await pdfParse(Buffer.from(newPdfBytes));
+              content = pageData.text;
+            } catch (parseErr) {
+              console.error(`PDF parse error for page ${i + 1}:`, parseErr.message);
+              content = '[PDFの解析に失敗しました]';
+            }
           }
 
-          // Save to database
+          // Save to local database with vector server's page_id
           db.prepare('INSERT INTO houses (id, project_id, filename, content) VALUES (?, ?, ?, ?)')
             .run(houseId, projectId, pageFilename, content);
 
           houseIds.push(houseId);
+          console.log(`Saved house ${houseId} (page ${i + 1})`);
         }
 
         // Delete original multi-page PDF
         fs.unlinkSync(filePath);
 
       } catch (err) {
-        console.error('PDF split error:', err.message);
-        // Fallback: save original file as single house
-        const houseId = uuidv4();
-        db.prepare('INSERT INTO houses (id, project_id, filename, content) VALUES (?, ?, ?, ?)')
-          .run(houseId, projectId, file.filename, '[PDFの分割に失敗しました]');
-        houseIds.push(houseId);
+        console.error('PDF processing error:', err.message);
+
+        // Fallback: process locally without vector server
+        try {
+          const pdfBytes = fs.readFileSync(filePath);
+          const pdfDoc = await PDFDocument.load(pdfBytes);
+          const pageCount = pdfDoc.getPageCount();
+
+          for (let i = 0; i < pageCount; i++) {
+            const houseId = uuidv4();
+            const newPdfDoc = await PDFDocument.create();
+            const [copiedPage] = await newPdfDoc.copyPages(pdfDoc, [i]);
+            newPdfDoc.addPage(copiedPage);
+
+            const pageFilename = `page_${i + 1}_${file.filename}`;
+            const pagePath = path.join(uploadDir, pageFilename);
+            const newPdfBytes = await newPdfDoc.save();
+            fs.writeFileSync(pagePath, newPdfBytes);
+
+            let content = '';
+            try {
+              const pageData = await pdfParse(Buffer.from(newPdfBytes));
+              content = pageData.text;
+            } catch (parseErr) {
+              content = '[PDFの解析に失敗しました]';
+            }
+
+            db.prepare('INSERT INTO houses (id, project_id, filename, content) VALUES (?, ?, ?, ?)')
+              .run(houseId, projectId, pageFilename, content);
+            houseIds.push(houseId);
+          }
+
+          fs.unlinkSync(filePath);
+        } catch (fallbackErr) {
+          console.error('Fallback processing error:', fallbackErr.message);
+          const houseId = uuidv4();
+          db.prepare('INSERT INTO houses (id, project_id, filename, content) VALUES (?, ?, ?, ?)')
+            .run(houseId, projectId, file.filename, '[処理に失敗しました]');
+          houseIds.push(houseId);
+        }
       }
     }
   }
@@ -284,11 +370,18 @@ async function analyzeUserProfile(projectId) {
   return profile;
 }
 
-// GPT Agent: Generate recommendations
+// Map local ratings to vector server ratings
+function mapRating(localRating) {
+  const ratingMap = {
+    'good': 'good',
+    'question': 'medium',
+    'bad': 'poor'
+  };
+  return ratingMap[localRating] || 'medium';
+}
+
+// Vector-based recommendations using Milvus
 async function generateRecommendations(projectId, round) {
-  if (!openai) {
-    throw new Error('OpenAI API key not configured');
-  }
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
 
   // Get all houses not yet recommended
@@ -304,40 +397,64 @@ async function generateRecommendations(projectId, round) {
     return [];
   }
 
-  const houseSummaries = availableHouses.map(h =>
-    `ID: ${h.id}\nファイル名: ${h.filename}\n内容: ${h.content?.substring(0, 800) || '内容不明'}`
-  ).join('\n\n---\n\n');
+  // Get all rated recommendations for this project
+  const ratedRecommendations = db.prepare(`
+    SELECT house_id, rating FROM recommendations
+    WHERE project_id = ? AND rating IS NOT NULL
+  `).all(projectId);
 
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4o',
-    messages: [
-      {
-        role: 'system',
-        content: `あなたは不動産推薦の専門家です。ユーザープロフィールに基づいて、最適な物件を10件選んでください。
-回答は以下の形式でIDのみをカンマ区切りで返してください：
-id1,id2,id3,...`
-      },
-      {
-        role: 'user',
-        content: `ユーザーの要望: ${project.user_requirements || '特になし'}
+  let selectedHouses = [];
 
-ユーザープロフィール: ${project.user_profile || '分析なし'}
+  // Try vector server recommendation API if we have ratings
+  if (ratedRecommendations.length > 0) {
+    try {
+      // Build ratings array for vector server
+      const ratingsForServer = ratedRecommendations.map(r => ({
+        page_id: r.house_id,
+        rating: mapRating(r.rating)
+      }));
 
-利用可能な物件:\n${houseSummaries}
+      console.log(`Calling vector server /api/v1/recommend with ${ratingsForServer.length} ratings`);
 
-最適な物件を最大10件選んでください。`
+      const response = await fetch(`${VECTOR_SERVER}/api/v1/recommend`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ratings: ratingsForServer,
+          limit: 10,
+          exclude_rated: true
+        })
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        console.log(`Vector server returned ${result.total_recommendations} recommendations`);
+
+        // Filter to only include houses from this project that haven't been recommended
+        for (const rec of result.recommendations || []) {
+          const house = db.prepare('SELECT * FROM houses WHERE id = ? AND project_id = ?')
+            .get(rec.page_id, projectId);
+          if (house && !recommendedHouseIds.includes(house.id)) {
+            selectedHouses.push(house);
+            if (selectedHouses.length >= 10) break;
+          }
+        }
+      } else {
+        const errorText = await response.text();
+        console.error('Vector recommend failed:', response.status, errorText);
       }
-    ]
-  });
+    } catch (err) {
+      console.error('Vector recommend error:', err.message);
+    }
+  }
 
-  const selectedIds = response.choices[0].message.content.split(',').map(id => id.trim());
-  const selectedHouses = availableHouses.filter(h => selectedIds.includes(h.id)).slice(0, 10);
-
-  // If not enough matches, fill with random
+  // Fallback: fill with random if not enough results
   if (selectedHouses.length < 10) {
+    const selectedIds = selectedHouses.map(h => h.id);
     const remaining = availableHouses.filter(h => !selectedIds.includes(h.id));
     const shuffled = remaining.sort(() => 0.5 - Math.random());
     selectedHouses.push(...shuffled.slice(0, 10 - selectedHouses.length));
+    console.log(`Filled with ${10 - selectedHouses.length + shuffled.slice(0, 10 - selectedHouses.length).length} random houses`);
   }
 
   // Create recommendation entries
@@ -416,8 +533,12 @@ app.get('/api/projects/:projectId/download/:round', (req, res) => {
 });
 
 // Delete project
-app.delete('/api/projects/:projectId', (req, res) => {
+app.delete('/api/projects/:projectId', async (req, res) => {
   const { projectId } = req.params;
+
+  // Note: Vector server doesn't have delete API yet
+  // Vectors will remain in Milvus (can be cleaned up manually later)
+  console.log(`Deleting project ${projectId} (vectors will remain in Milvus)`);
 
   db.prepare('DELETE FROM recommendations WHERE project_id = ?').run(projectId);
   db.prepare('DELETE FROM houses WHERE project_id = ?').run(projectId);
