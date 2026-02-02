@@ -11,6 +11,7 @@ import pdfParse from 'pdf-parse';
 import archiver from 'archiver';
 import { PDFDocument } from 'pdf-lib';
 import FormData from 'form-data';
+import axios from 'axios';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -28,7 +29,8 @@ if (!openai) {
 }
 
 // Vector server configuration
-const VECTOR_SERVER = process.env.VECTOR_SERVER || 'https://greasier-grossly-betty.ngrok-free.dev';
+const VECTOR_SERVER_BASE = process.env.VECTOR_SERVER || 'https://greasier-grossly-betty.ngrok-free.dev';
+const VECTOR_SERVER = `${VECTOR_SERVER_BASE}/api/hybrid-rag`;
 console.log(`Vector server: ${VECTOR_SERVER}`);
 
 // Middleware
@@ -167,23 +169,30 @@ app.post('/api/projects/:projectId/upload', upload.array('files'), async (req, r
       try {
         // Send PDF to vector server first
         console.log(`Sending PDF to vector server: ${file.filename}`);
+
+        // Use axios with form-data for reliable multipart upload
         const formData = new FormData();
-        formData.append('file', fs.createReadStream(filePath), file.filename);
+        formData.append('file', fs.createReadStream(filePath), {
+          filename: file.filename,
+          contentType: 'application/pdf'
+        });
         formData.append('metadata', JSON.stringify({ project_id: projectId }));
         formData.append('build_immediately', 'true');
 
-        const vectorResponse = await fetch(`${VECTOR_SERVER}/api/v1/pdf/process`, {
-          method: 'POST',
-          body: formData,
-          headers: formData.getHeaders()
-        });
+        const vectorResponse = await axios.post(
+          `${VECTOR_SERVER}/api/v1/pdf/process`,
+          formData,
+          {
+            headers: {
+              ...formData.getHeaders(),
+              'ngrok-skip-browser-warning': 'true'
+            },
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity
+          }
+        );
 
-        if (!vectorResponse.ok) {
-          const errorText = await vectorResponse.text();
-          throw new Error(`Vector server error: ${vectorResponse.status} - ${errorText}`);
-        }
-
-        const vectorResult = await vectorResponse.json();
+        const vectorResult = vectorResponse.data;
         console.log(`Vector server processed ${vectorResult.processed_pages} pages, page_ids:`, vectorResult.page_ids);
 
         // Now split PDF locally and use vector server's page_ids
@@ -380,7 +389,7 @@ function mapRating(localRating) {
   return ratingMap[localRating] || 'medium';
 }
 
-// Vector-based recommendations using Milvus
+// Recommendations with fallback: Vector Server → GPT → Random
 async function generateRecommendations(projectId, round) {
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
 
@@ -404,21 +413,24 @@ async function generateRecommendations(projectId, round) {
   `).all(projectId);
 
   let selectedHouses = [];
+  let vectorServerSuccess = false;
 
-  // Try vector server recommendation API if we have ratings
+  // ============ 1. Try Vector Server First ============
   if (ratedRecommendations.length > 0) {
     try {
-      // Build ratings array for vector server
       const ratingsForServer = ratedRecommendations.map(r => ({
         page_id: r.house_id,
         rating: mapRating(r.rating)
       }));
 
-      console.log(`Calling vector server /api/v1/recommend with ${ratingsForServer.length} ratings`);
+      console.log(`[Vector] Calling /api/v1/recommend with ${ratingsForServer.length} ratings`);
 
       const response = await fetch(`${VECTOR_SERVER}/api/v1/recommend`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'ngrok-skip-browser-warning': 'true'
+        },
         body: JSON.stringify({
           ratings: ratingsForServer,
           limit: 10,
@@ -428,9 +440,8 @@ async function generateRecommendations(projectId, round) {
 
       if (response.ok) {
         const result = await response.json();
-        console.log(`Vector server returned ${result.total_recommendations} recommendations`);
+        console.log(`[Vector] Server returned ${result.total_recommendations} recommendations`);
 
-        // Filter to only include houses from this project that haven't been recommended
         for (const rec of result.recommendations || []) {
           const house = db.prepare('SELECT * FROM houses WHERE id = ? AND project_id = ?')
             .get(rec.page_id, projectId);
@@ -439,22 +450,74 @@ async function generateRecommendations(projectId, round) {
             if (selectedHouses.length >= 10) break;
           }
         }
+
+        if (selectedHouses.length > 0) {
+          vectorServerSuccess = true;
+          console.log(`[Vector] Got ${selectedHouses.length} valid recommendations`);
+        }
       } else {
         const errorText = await response.text();
-        console.error('Vector recommend failed:', response.status, errorText);
+        console.error('[Vector] Failed:', response.status, errorText);
       }
     } catch (err) {
-      console.error('Vector recommend error:', err.message);
+      console.error('[Vector] Error:', err.message);
     }
   }
 
-  // Fallback: fill with random if not enough results
+  // ============ 2. Fallback to GPT if Vector Server failed or not enough ============
+  if (selectedHouses.length < 10 && openai) {
+    try {
+      console.log(`[GPT] Trying GPT fallback (have ${selectedHouses.length} from vector)`);
+
+      const selectedIds = selectedHouses.map(h => h.id);
+      const remainingHouses = availableHouses.filter(h => !selectedIds.includes(h.id));
+
+      if (remainingHouses.length > 0) {
+        const houseSummaries = remainingHouses.map(h =>
+          `ID: ${h.id}\nファイル名: ${h.filename}\n内容: ${h.content?.substring(0, 800) || '内容不明'}`
+        ).join('\n\n---\n\n');
+
+        const gptResponse = await openai.chat.completions.create({
+          model: 'gpt-4o',
+          messages: [
+            {
+              role: 'system',
+              content: `あなたは不動産推薦の専門家です。ユーザープロフィールに基づいて、最適な物件を選んでください。
+回答は以下の形式でIDのみをカンマ区切りで返してください：
+id1,id2,id3,...`
+            },
+            {
+              role: 'user',
+              content: `ユーザーの要望: ${project.user_requirements || '特になし'}
+
+ユーザープロフィール: ${project.user_profile || '分析なし'}
+
+利用可能な物件:\n${houseSummaries}
+
+最適な物件を最大${10 - selectedHouses.length}件選んでください。`
+            }
+          ]
+        });
+
+        const gptSelectedIds = gptResponse.choices[0].message.content.split(',').map(id => id.trim());
+        const gptHouses = remainingHouses.filter(h => gptSelectedIds.includes(h.id));
+
+        console.log(`[GPT] Selected ${gptHouses.length} houses`);
+        selectedHouses.push(...gptHouses.slice(0, 10 - selectedHouses.length));
+      }
+    } catch (gptErr) {
+      console.error('[GPT] Error:', gptErr.message);
+    }
+  }
+
+  // ============ 3. Final Fallback: Random ============
   if (selectedHouses.length < 10) {
     const selectedIds = selectedHouses.map(h => h.id);
     const remaining = availableHouses.filter(h => !selectedIds.includes(h.id));
     const shuffled = remaining.sort(() => 0.5 - Math.random());
-    selectedHouses.push(...shuffled.slice(0, 10 - selectedHouses.length));
-    console.log(`Filled with ${10 - selectedHouses.length + shuffled.slice(0, 10 - selectedHouses.length).length} random houses`);
+    const fillCount = Math.min(10 - selectedHouses.length, shuffled.length);
+    selectedHouses.push(...shuffled.slice(0, fillCount));
+    console.log(`[Random] Filled with ${fillCount} random houses`);
   }
 
   // Create recommendation entries
@@ -478,11 +541,20 @@ app.post('/api/projects/:projectId/next-round', async (req, res) => {
   const nextRound = project.current_round;
 
   try {
-    // First analyze user profile
-    await analyzeUserProfile(projectId);
+    // First analyze user profile (optional, may timeout)
+    console.log(`Starting next round ${nextRound} for project ${projectId}`);
+    try {
+      console.log('Analyzing user profile with GPT...');
+      await analyzeUserProfile(projectId);
+      console.log('User profile analysis complete');
+    } catch (profileErr) {
+      console.error('Profile analysis failed (continuing without it):', profileErr.message);
+    }
 
     // Then generate recommendations
+    console.log('Generating recommendations...');
     const houses = await generateRecommendations(projectId, nextRound);
+    console.log(`Generated ${houses.length} recommendations`);
 
     res.json({ houses, round: nextRound });
   } catch (error) {
