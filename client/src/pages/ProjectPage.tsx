@@ -39,11 +39,14 @@ function ProjectPage() {
   const { projectId } = useParams<{ projectId: string }>()
   const navigate = useNavigate()
   const [project, setProject] = useState<Project | null>(null)
-  const [currentTab, setCurrentTab] = useState(0)
+  const [currentTab, setCurrentTab] = useState(-1) // -1 = 基本情報, 0 = ランダム選択, 1-3 = 推薦ラウンド
   const [roundHouses, setRoundHouses] = useState<House[]>([])
   const [ratings, setRatings] = useState<RatingState>({})
   const [loading, setLoading] = useState(true)
   const [processing, setProcessing] = useState(false)
+  const [editingRequirements, setEditingRequirements] = useState(false)
+  const [requirementsText, setRequirementsText] = useState('')
+  const [searchingProperties, setSearchingProperties] = useState(false)
 
   useEffect(() => {
     if (projectId) {
@@ -52,7 +55,7 @@ function ProjectPage() {
   }, [projectId])
 
   useEffect(() => {
-    if (project) {
+    if (project && currentTab >= 0) {
       fetchRoundData(currentTab)
     }
   }, [currentTab, project?.id])
@@ -61,7 +64,13 @@ function ProjectPage() {
     try {
       const res = await axios.get(`/api/projects/${projectId}`)
       setProject(res.data)
-      setCurrentTab(res.data.current_round)
+      setRequirementsText(res.data.user_requirements || '')
+      // Start at 基本情報 tab if no rounds started, otherwise go to current round
+      if (res.data.current_round === 0 && (!res.data.recommendations || res.data.recommendations.length === 0)) {
+        setCurrentTab(-1)
+      } else {
+        setCurrentTab(res.data.current_round)
+      }
       setLoading(false)
     } catch (err) {
       console.error('Failed to fetch project:', err)
@@ -179,8 +188,31 @@ function ProjectPage() {
     window.open(`/api/projects/${projectId}/download/${currentTab}`, '_blank')
   }
 
+  const searchProperties = async () => {
+    if (!project?.user_requirements) {
+      alert('お客様の要望を入力してください')
+      return
+    }
+
+    setSearchingProperties(true)
+    try {
+      const res = await axios.post(`/api/projects/${projectId}/search-properties`, {
+        userRequirements: project.user_requirements
+      })
+      alert(res.data.message || '物件を取得しました')
+      await fetchProject() // Refresh to show new houses
+    } catch (err: any) {
+      console.error('Failed to search properties:', err)
+      const errorMsg = err.response?.data?.error || err.response?.data?.details || '物件検索に失敗しました'
+      alert(errorMsg)
+    } finally {
+      setSearchingProperties(false)
+    }
+  }
+
   const getTabLabel = (round: number) => {
     switch (round) {
+      case -1: return '基本情報'
       case 0: return 'ランダム選択'
       case 1: return '第1ラウンド推薦'
       case 2: return '第2ラウンド推薦'
@@ -236,23 +268,136 @@ function ProjectPage() {
 
       {/* Tabs */}
       <div className="tabs">
-        {[0, 1, 2, 3].map(round => (
+        {[-1, 0, 1, 2, 3].map(round => (
           <button
             key={round}
             className={`tab ${currentTab === round ? 'active' : ''}`}
             onClick={() => setCurrentTab(round)}
-            disabled={round > project.current_round}
+            disabled={round > project.current_round && round !== -1}
           >
             {getTabLabel(round)}
           </button>
         ))}
       </div>
 
-      {/* Requirements Section */}
-      {project.user_requirements && (
+      {/* 基本情報 Tab Content */}
+      {currentTab === -1 && (
+        <div className="card">
+          <h3 style={{ marginBottom: '20px' }}>お客様基本情報</h3>
+
+          {editingRequirements ? (
+            <>
+              <textarea
+                className="textarea"
+                style={{ minHeight: '300px', fontFamily: 'monospace', fontSize: '0.9rem' }}
+                value={requirementsText}
+                onChange={(e) => setRequirementsText(e.target.value)}
+                placeholder="お客様の基本情報を入力..."
+              />
+              <div style={{ display: 'flex', gap: '10px', marginTop: '15px' }}>
+                <button
+                  className="btn btn-primary"
+                  onClick={async () => {
+                    try {
+                      await axios.put(`/api/projects/${projectId}/requirements`, {
+                        requirements: requirementsText
+                      })
+                      setProject(prev => prev ? { ...prev, user_requirements: requirementsText } : null)
+                      setEditingRequirements(false)
+                      alert('保存しました')
+                    } catch (err) {
+                      console.error('Failed to save:', err)
+                      alert('保存に失敗しました')
+                    }
+                  }}
+                >
+                  保存
+                </button>
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => {
+                    setRequirementsText(project.user_requirements || '')
+                    setEditingRequirements(false)
+                  }}
+                >
+                  キャンセル
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div style={{
+                background: '#f8f9fa',
+                padding: '20px',
+                borderRadius: '8px',
+                whiteSpace: 'pre-wrap',
+                fontFamily: 'monospace',
+                fontSize: '0.9rem',
+                lineHeight: '1.8',
+                minHeight: '200px'
+              }}>
+                {project.user_requirements || '（情報なし）'}
+              </div>
+              <button
+                className="btn btn-secondary"
+                style={{ marginTop: '15px' }}
+                onClick={() => setEditingRequirements(true)}
+              >
+                編集
+              </button>
+            </>
+          )}
+
+          {/* Property Search Section */}
+          <div style={{
+            marginTop: '30px',
+            padding: '20px',
+            background: '#e8f5e9',
+            borderRadius: '8px'
+          }}>
+            <h4 style={{ marginBottom: '15px', color: '#2e7d32' }}>🔍 物件を検索</h4>
+            <p style={{ fontSize: '0.9rem', color: '#666', marginBottom: '15px' }}>
+              お客様の要望に基づいて、外部APIから物件PDFを自動取得します。
+            </p>
+            <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+              <button
+                className="btn btn-primary"
+                style={{ background: '#2e7d32' }}
+                onClick={searchProperties}
+                disabled={searchingProperties || !project.user_requirements}
+              >
+                {searchingProperties ? '検索中...' : '物件を検索して取得'}
+              </button>
+              {project.houses.length > 0 && (
+                <span style={{ fontSize: '0.9rem', color: '#666' }}>
+                  現在 {project.houses.length} 件の物件があります
+                </span>
+              )}
+            </div>
+          </div>
+
+          <div style={{ marginTop: '30px', textAlign: 'center' }}>
+            <p style={{ color: '#666', marginBottom: '15px' }}>
+              {project.houses.length > 0
+                ? '物件の準備ができました。ランダム選択に進んでください。'
+                : '物件を検索するか、PDFをアップロードしてください。'}
+            </p>
+            <button
+              className="btn btn-primary"
+              onClick={() => setCurrentTab(0)}
+              disabled={project.houses.length === 0}
+            >
+              ランダム選択へ進む →
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Requirements Section (shown on other tabs) */}
+      {currentTab >= 0 && project.user_requirements && (
         <div className="requirements-section">
           <h3>お客様の要望</h3>
-          <p>{project.user_requirements}</p>
+          <p style={{ whiteSpace: 'pre-wrap' }}>{project.user_requirements}</p>
         </div>
       )}
 
@@ -271,18 +416,24 @@ function ProjectPage() {
           <p style={{ marginBottom: '20px', color: '#666' }}>
             アップロードされた{project.houses.length}件の物件から10件をランダムに選択します
           </p>
-          <button
-            className="btn btn-primary"
-            onClick={startRandomSample}
-            disabled={processing}
-          >
-            {processing ? '処理中...' : 'ランダム選択を開始'}
-          </button>
+          {project.houses.length === 0 ? (
+            <p style={{ color: '#dc2626' }}>
+              まず物件PDFをアップロードしてください
+            </p>
+          ) : (
+            <button
+              className="btn btn-primary"
+              onClick={startRandomSample}
+              disabled={processing}
+            >
+              {processing ? '処理中...' : 'ランダム選択を開始'}
+            </button>
+          )}
         </div>
       )}
 
       {/* Houses Grid */}
-      {roundHouses.length > 0 && (
+      {currentTab >= 0 && roundHouses.length > 0 && (
         <div className="houses-grid">
           {roundHouses.map((house) => (
             <div key={house.id} className="house-card">
@@ -339,7 +490,7 @@ function ProjectPage() {
       )}
 
       {/* Action Bar */}
-      {roundHouses.length > 0 && (
+      {currentTab >= 0 && roundHouses.length > 0 && (
         <div className="action-bar">
           <button className="btn btn-secondary" onClick={downloadAll}>
             一括ダウンロード

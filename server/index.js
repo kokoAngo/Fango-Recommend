@@ -12,6 +12,7 @@ import archiver from 'archiver';
 import { PDFDocument } from 'pdf-lib';
 import FormData from 'form-data';
 import axios from 'axios';
+import suumoScraper from './suumo-scraper.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -32,6 +33,11 @@ if (!openai) {
 const VECTOR_SERVER_BASE = process.env.VECTOR_SERVER || 'https://greasier-grossly-betty.ngrok-free.dev';
 const VECTOR_SERVER = `${VECTOR_SERVER_BASE}/api/hybrid-rag`;
 console.log(`Vector server: ${VECTOR_SERVER}`);
+
+// External property search API configuration
+const EXTERNAL_API_URL = process.env.EXTERNAL_API_URL || 'http://localhost:3000';
+const EXTERNAL_API_KEY = process.env.EXTERNAL_API_KEY || 'fango-api-2024-secret-key-x7k9m2';
+console.log(`External API: ${EXTERNAL_API_URL}`);
 
 // Middleware
 app.use(cors());
@@ -117,6 +123,55 @@ app.post('/api/projects', (req, res) => {
   res.json({ id, name: name || '新規プロジェクト' });
 });
 
+// ============ SUUMO Integration APIs ============
+
+// Get customer list from SUUMO JDS
+app.get('/api/suumo/customers', async (req, res) => {
+  try {
+    console.log('[API] Fetching SUUMO customers...');
+    const customers = await suumoScraper.getCustomerList();
+    res.json({ customers });
+  } catch (error) {
+    console.error('[API] SUUMO customer fetch error:', error.message);
+    res.status(500).json({ error: 'Failed to fetch customers from SUUMO', details: error.message });
+  }
+});
+
+// Import a customer from SUUMO and create a project
+app.post('/api/suumo/import/:customerId', async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { customerData } = req.body;
+
+    console.log(`[API] Importing SUUMO customer ${customerId}...`);
+
+    // Build requirements from customer data (already extracted from list)
+    const details = await suumoScraper.getCustomerRequirements(customerId, customerData);
+
+    // Create new project
+    const projectId = uuidv4();
+    const projectName = details.name || customerData?.name || `SUUMO顧客 ${customerId}`;
+
+    db.prepare('INSERT INTO projects (id, name, user_requirements) VALUES (?, ?, ?)')
+      .run(projectId, projectName, details.requirements);
+
+    // Create upload directory for this project
+    fs.mkdirSync(path.join(__dirname, 'uploads', projectId), { recursive: true });
+
+    console.log(`[API] Created project ${projectId} for customer ${details.name}`);
+
+    res.json({
+      projectId,
+      name: projectName,
+      requirements: details.requirements,
+      customerDetails: details
+    });
+  } catch (error) {
+    console.error('[API] SUUMO import error:', error.message);
+    res.status(500).json({ error: 'Failed to import customer from SUUMO', details: error.message });
+  }
+});
+
 // Get project by ID
 app.get('/api/projects/:projectId', (req, res) => {
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
@@ -128,6 +183,152 @@ app.get('/api/projects/:projectId', (req, res) => {
   const recommendations = db.prepare('SELECT * FROM recommendations WHERE project_id = ?').all(req.params.projectId);
 
   res.json({ ...project, houses, recommendations });
+});
+
+// Update project requirements
+app.put('/api/projects/:projectId/requirements', (req, res) => {
+  const { projectId } = req.params;
+  const { requirements } = req.body;
+
+  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
+  if (!project) {
+    return res.status(404).json({ error: 'Project not found' });
+  }
+
+  db.prepare('UPDATE projects SET user_requirements = ? WHERE id = ?').run(requirements, projectId);
+
+  res.json({ success: true, requirements });
+});
+
+// Search properties using external API and save PDF
+app.post('/api/projects/:projectId/search-properties', async (req, res) => {
+  const { projectId } = req.params;
+  const { userRequirements, typeId } = req.body;
+
+  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
+  if (!project) {
+    return res.status(404).json({ error: 'Project not found' });
+  }
+
+  if (!EXTERNAL_API_KEY) {
+    return res.status(500).json({ error: 'External API key not configured. Set EXTERNAL_API_KEY environment variable.' });
+  }
+
+  try {
+    console.log(`[External API] Searching properties for project ${projectId}...`);
+    console.log(`[External API] Requirements: ${userRequirements?.substring(0, 100)}...`);
+
+    // Call external API to get PDF
+    const response = await axios.post(
+      `${EXTERNAL_API_URL}/api/external/search-pdf`,
+      {
+        userRequirements: userRequirements || project.user_requirements,
+        typeId: typeId
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': EXTERNAL_API_KEY
+        },
+        responseType: 'arraybuffer',
+        timeout: 120000 // 2 minutes timeout
+      }
+    );
+
+    // Save PDF to project directory
+    const uploadDir = path.join(__dirname, 'uploads', projectId);
+    fs.mkdirSync(uploadDir, { recursive: true });
+
+    const pdfFilename = `search_result_${Date.now()}.pdf`;
+    const pdfPath = path.join(uploadDir, pdfFilename);
+    fs.writeFileSync(pdfPath, response.data);
+
+    console.log(`[External API] PDF saved: ${pdfFilename} (${response.data.length} bytes)`);
+
+    // Process the PDF (split pages, send to vector server, etc.)
+    const pdfBytes = response.data;
+    const pdfDoc = await PDFDocument.load(pdfBytes);
+    const pageCount = pdfDoc.getPageCount();
+
+    console.log(`[External API] Processing PDF: ${pageCount} pages`);
+
+    let processedPages = 0;
+    const houseIds = [];
+
+    // Try to send to vector server first
+    try {
+      const formData = new FormData();
+      formData.append('file', Buffer.from(pdfBytes), {
+        filename: pdfFilename,
+        contentType: 'application/pdf'
+      });
+      formData.append('metadata', JSON.stringify({ project_id: projectId }));
+      formData.append('build_immediately', 'true');
+
+      const vectorResponse = await axios.post(
+        `${VECTOR_SERVER}/api/v1/pdf/process`,
+        formData,
+        {
+          headers: {
+            ...formData.getHeaders(),
+            'ngrok-skip-browser-warning': 'true'
+          },
+          maxContentLength: Infinity,
+          maxBodyLength: Infinity,
+          timeout: 3000000
+        }
+      );
+
+      if (vectorResponse.data.page_ids) {
+        houseIds.push(...vectorResponse.data.page_ids);
+        console.log(`[External API] Vector server processed ${houseIds.length} pages`);
+      }
+    } catch (vectorErr) {
+      console.error('[External API] Vector server error:', vectorErr.message);
+    }
+
+    // Split PDF and save each page
+    for (let i = 0; i < pageCount; i++) {
+      const houseId = houseIds[i] || uuidv4();
+      const pageFilename = `page_${i + 1}_${pdfFilename}`;
+
+      const newPdfDoc = await PDFDocument.create();
+      const [copiedPage] = await newPdfDoc.copyPages(pdfDoc, [i]);
+      newPdfDoc.addPage(copiedPage);
+
+      const pagePath = path.join(uploadDir, pageFilename);
+      const newPdfBytes = await newPdfDoc.save();
+      fs.writeFileSync(pagePath, newPdfBytes);
+
+      // Save to database
+      db.prepare('INSERT INTO houses (id, project_id, filename, content) VALUES (?, ?, ?, ?)')
+        .run(houseId, projectId, pageFilename, `外部API検索結果 - ページ${i + 1}`);
+
+      processedPages++;
+    }
+
+    // Delete the original combined PDF
+    fs.unlinkSync(pdfPath);
+
+    console.log(`[External API] Processed ${processedPages} pages for project ${projectId}`);
+
+    res.json({
+      success: true,
+      message: `${processedPages}件の物件を取得しました`,
+      processedPages,
+      houseIds: houseIds.length > 0 ? houseIds : undefined
+    });
+
+  } catch (error) {
+    console.error('[External API] Error:', error.message);
+    if (error.response) {
+      console.error('[External API] Response status:', error.response.status);
+    }
+    res.status(500).json({
+      error: 'Failed to search properties',
+      details: error.message
+    });
+  }
 });
 
 // Upload files to project - sends PDF to vector server and uses returned page_ids

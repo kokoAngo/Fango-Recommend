@@ -9,6 +9,16 @@ interface Project {
   current_round: number
 }
 
+interface SuumoCustomer {
+  id: string
+  name: string
+  date: string
+  phone: string
+  email: string
+  propertyName: string
+  hasDetailPage: boolean
+}
+
 function HomePage() {
   const [projects, setProjects] = useState<Project[]>([])
   const [files, setFiles] = useState<File[]>([])
@@ -19,6 +29,12 @@ function HomePage() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
   const navigate = useNavigate()
+
+  // SUUMO integration state
+  const [suumoCustomers, setSuumoCustomers] = useState<SuumoCustomer[]>([])
+  const [showSuumoModal, setShowSuumoModal] = useState(false)
+  const [suumoLoading, setSuumoLoading] = useState(false)
+  const [importingCustomerId, setImportingCustomerId] = useState<string | null>(null)
 
   useEffect(() => {
     fetchProjects()
@@ -130,6 +146,38 @@ function HomePage() {
     }
   }
 
+  // Fetch customers from SUUMO
+  const fetchSuumoCustomers = async () => {
+    setSuumoLoading(true)
+    try {
+      const res = await axios.get('/api/suumo/customers')
+      setSuumoCustomers(res.data.customers || [])
+      setShowSuumoModal(true)
+    } catch (err) {
+      console.error('Failed to fetch SUUMO customers:', err)
+      alert('SUUMOからの顧客取得に失敗しました')
+    } finally {
+      setSuumoLoading(false)
+    }
+  }
+
+  // Import a customer from SUUMO and create a project
+  const importSuumoCustomer = async (customer: SuumoCustomer) => {
+    setImportingCustomerId(customer.id)
+    try {
+      const res = await axios.post(`/api/suumo/import/${customer.id}`, {
+        customerData: customer
+      })
+      setShowSuumoModal(false)
+      navigate(`/project/${res.data.projectId}`)
+    } catch (err) {
+      console.error('Failed to import SUUMO customer:', err)
+      alert('顧客のインポートに失敗しました')
+    } finally {
+      setImportingCustomerId(null)
+    }
+  }
+
   return (
     <>
       <header className="header">
@@ -140,7 +188,17 @@ function HomePage() {
       <div className="home-grid">
         {/* New Project Section */}
         <div className="card">
-          <h2>新規プロジェクト</h2>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+            <h2 style={{ margin: 0 }}>新規プロジェクト</h2>
+            <button
+              className="btn btn-secondary"
+              onClick={fetchSuumoCustomers}
+              disabled={suumoLoading}
+              style={{ fontSize: '0.85rem' }}
+            >
+              {suumoLoading ? '取得中...' : '📥 SUUMOから取得'}
+            </button>
+          </div>
 
           <div className="form-group" style={{ marginBottom: '20px' }}>
             <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500' }}>
@@ -317,6 +375,86 @@ function HomePage() {
           )}
         </div>
       </div>
+
+      {/* SUUMO Customer Modal */}
+      {showSuumoModal && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          background: 'rgba(0,0,0,0.5)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1000
+        }}>
+          <div style={{
+            background: 'white',
+            borderRadius: '12px',
+            padding: '24px',
+            maxWidth: '800px',
+            width: '95%',
+            maxHeight: '80vh',
+            overflow: 'auto'
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+              <h3 style={{ margin: 0 }}>SUUMO 顧客一覧</h3>
+              <button
+                onClick={() => setShowSuumoModal(false)}
+                style={{ background: 'none', border: 'none', fontSize: '1.5rem', cursor: 'pointer' }}
+              >
+                ✕
+              </button>
+            </div>
+
+            {suumoCustomers.length === 0 ? (
+              <div style={{ textAlign: 'center', padding: '40px', color: '#666' }}>
+                <p>顧客が見つかりませんでした</p>
+                <p style={{ fontSize: '0.9rem' }}>SUUMOで「検索する」を実行してから再度お試しください</p>
+              </div>
+            ) : (
+              <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+                {suumoCustomers.map((customer) => (
+                  <li
+                    key={customer.id}
+                    style={{
+                      padding: '16px',
+                      borderBottom: '1px solid #eee',
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center'
+                    }}
+                  >
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontWeight: '500', marginBottom: '4px' }}>
+                        {customer.name || `顧客 ${customer.id}`}
+                      </div>
+                      <div style={{ fontSize: '0.85rem', color: '#666', marginBottom: '2px' }}>
+                        {customer.date && <span>📅 {customer.date} </span>}
+                        {customer.propertyName && <span>🏠 {customer.propertyName}</span>}
+                      </div>
+                      <div style={{ fontSize: '0.8rem', color: '#888' }}>
+                        {customer.phone && <span>📞 {customer.phone} </span>}
+                        {customer.email && <span>✉️ {customer.email}</span>}
+                      </div>
+                    </div>
+                    <button
+                      className="btn btn-primary"
+                      style={{ fontSize: '0.85rem', padding: '8px 16px' }}
+                      onClick={() => importSuumoCustomer(customer)}
+                      disabled={importingCustomerId === customer.id}
+                    >
+                      {importingCustomerId === customer.id ? 'インポート中...' : 'インポート'}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+      )}
     </>
   )
 }
