@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
@@ -13,6 +14,7 @@ import { PDFDocument } from 'pdf-lib';
 import FormData from 'form-data';
 import axios from 'axios';
 import suumoScraper from './suumo-scraper.js';
+import { syncPropertyToNotion, extractPropertyInfo, clearPropertyCache, cleanupDuplicates } from './notion-sync.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -100,6 +102,159 @@ db.exec(`
   );
 `);
 
+// Add suumo_customer_id column if not exists (for existing databases)
+try {
+  db.exec('ALTER TABLE projects ADD COLUMN suumo_customer_id TEXT');
+  console.log('Added suumo_customer_id column to projects table');
+} catch (e) {
+  // Column already exists, ignore
+}
+
+// Create index after ensuring column exists
+try {
+  db.exec('CREATE INDEX IF NOT EXISTS idx_projects_suumo_customer_id ON projects(suumo_customer_id)');
+} catch (e) {
+  // Index creation failed, ignore
+}
+
+// ============ SUUMO Auto-Sync Configuration ============
+const SUUMO_AUTO_SYNC_INTERVAL = parseInt(process.env.SUUMO_SYNC_INTERVAL || '3600000'); // Default: 1 hour (3600000ms)
+let suumoAutoSyncEnabled = process.env.SUUMO_AUTO_SYNC !== 'false'; // Enabled by default, can be toggled at runtime
+
+// Parse SUUMO date format (e.g., "2026/1/28 10:21:05") to SQLite format ("2026-01-28 10:21:05")
+function parseSuumoDate(dateStr) {
+  if (!dateStr) return null;
+  try {
+    // Match format: YYYY/M/D H:M:S or YYYY/MM/DD HH:MM:SS
+    const match = dateStr.match(/(\d{4})\/(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{1,2}):(\d{1,2})/);
+    if (match) {
+      const [, year, month, day, hour, min, sec] = match;
+      return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')} ${hour.padStart(2, '0')}:${min.padStart(2, '0')}:${sec.padStart(2, '0')}`;
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Auto-sync function: Import new customers from SUUMO
+async function autoSyncSuumoCustomers() {
+  console.log('[SUUMO Auto-Sync] Starting automatic customer sync...');
+
+  try {
+    // Get current customer list from SUUMO
+    const customers = await suumoScraper.getCustomerList();
+    console.log(`[SUUMO Auto-Sync] Found ${customers.length} customers in SUUMO`);
+
+    // Get existing SUUMO customer IDs from database
+    const existingIds = db.prepare('SELECT suumo_customer_id FROM projects WHERE suumo_customer_id IS NOT NULL')
+      .all()
+      .map(p => p.suumo_customer_id);
+
+    // Find new customers
+    const newCustomers = customers.filter(c => !existingIds.includes(c.id));
+    console.log(`[SUUMO Auto-Sync] ${newCustomers.length} new customers to import`);
+
+    // Import each new customer
+    let importedCount = 0;
+    for (const customer of newCustomers) {
+      try {
+        console.log(`[SUUMO Auto-Sync] Importing customer ${customer.name} (ID: ${customer.id})...`);
+
+        // Get detailed requirements
+        const details = await suumoScraper.getCustomerRequirements(customer.id, customer);
+
+        // Create new project with suumo_customer_id and inquiry date
+        const projectId = uuidv4();
+        const projectName = details.name || customer.name || `SUUMO顧客 ${customer.id}`;
+        const createdAt = parseSuumoDate(details.inquiryDate);
+
+        if (createdAt) {
+          db.prepare('INSERT INTO projects (id, name, user_requirements, suumo_customer_id, created_at) VALUES (?, ?, ?, ?, ?)')
+            .run(projectId, projectName, details.requirements, customer.id, createdAt);
+        } else {
+          db.prepare('INSERT INTO projects (id, name, user_requirements, suumo_customer_id) VALUES (?, ?, ?, ?)')
+            .run(projectId, projectName, details.requirements, customer.id);
+        }
+
+        // Create upload directory
+        fs.mkdirSync(path.join(__dirname, 'uploads', projectId), { recursive: true });
+
+        console.log(`[SUUMO Auto-Sync] Created project ${projectId} for customer ${details.name}`);
+        importedCount++;
+
+        // Sync property info to Notion
+        if (details.rawDetails) {
+          const propertyInfo = extractPropertyInfo(details.rawDetails);
+          if (propertyInfo && propertyInfo['物件名']) {
+            const notionResult = await syncPropertyToNotion(propertyInfo);
+            if (notionResult.success) {
+              console.log(`[SUUMO Auto-Sync] Notion sync: ${notionResult.action} "${propertyInfo['物件名']}" (反響数: ${notionResult.newCount})`);
+            }
+          }
+        }
+
+        // Small delay between imports to avoid overwhelming the server
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      } catch (importError) {
+        console.error(`[SUUMO Auto-Sync] Failed to import customer ${customer.id}:`, importError.message);
+      }
+    }
+
+    console.log(`[SUUMO Auto-Sync] Completed. Imported ${importedCount} new customers.`);
+    return { total: customers.length, newCount: newCustomers.length, imported: importedCount };
+  } catch (error) {
+    console.error('[SUUMO Auto-Sync] Error:', error.message);
+    throw error;
+  }
+}
+
+// Start auto-sync timer
+let autoSyncTimer = null;
+let initialSyncTimeout = null;
+
+function startAutoSync(runInitialSync = true) {
+  if (autoSyncTimer) {
+    console.log('[SUUMO Auto-Sync] Already running');
+    return;
+  }
+
+  suumoAutoSyncEnabled = true;
+  console.log(`[SUUMO Auto-Sync] Started, interval: ${SUUMO_AUTO_SYNC_INTERVAL / 1000 / 60} minutes`);
+
+  // Run first sync after 10 seconds (give time for server to fully start)
+  if (runInitialSync) {
+    initialSyncTimeout = setTimeout(() => {
+      if (suumoAutoSyncEnabled) {
+        autoSyncSuumoCustomers().catch(err => console.error('[SUUMO Auto-Sync] Initial sync failed:', err.message));
+      }
+    }, 10000);
+  }
+
+  // Set up recurring sync
+  autoSyncTimer = setInterval(() => {
+    if (suumoAutoSyncEnabled) {
+      autoSyncSuumoCustomers().catch(err => console.error('[SUUMO Auto-Sync] Scheduled sync failed:', err.message));
+    }
+  }, SUUMO_AUTO_SYNC_INTERVAL);
+}
+
+function stopAutoSync() {
+  suumoAutoSyncEnabled = false;
+
+  if (initialSyncTimeout) {
+    clearTimeout(initialSyncTimeout);
+    initialSyncTimeout = null;
+  }
+
+  if (autoSyncTimer) {
+    clearInterval(autoSyncTimer);
+    autoSyncTimer = null;
+  }
+
+  console.log('[SUUMO Auto-Sync] Stopped');
+}
+
 // Serve uploaded files
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
@@ -125,6 +280,164 @@ app.post('/api/projects', (req, res) => {
 
 // ============ SUUMO Integration APIs ============
 
+// Manually trigger SUUMO sync
+app.post('/api/suumo/sync', async (req, res) => {
+  try {
+    console.log('[API] Manual SUUMO sync triggered...');
+    const result = await autoSyncSuumoCustomers();
+    res.json({
+      success: true,
+      message: `同期完了: ${result.imported}件の新規顧客をインポートしました`,
+      ...result
+    });
+  } catch (error) {
+    console.error('[API] Manual SUUMO sync error:', error.message);
+    res.status(500).json({ error: 'SUUMO同期に失敗しました', details: error.message });
+  }
+});
+
+// Get SUUMO sync status
+app.get('/api/suumo/status', (req, res) => {
+  const totalProjects = db.prepare('SELECT COUNT(*) as count FROM projects').get().count;
+  const suumoProjects = db.prepare('SELECT COUNT(*) as count FROM projects WHERE suumo_customer_id IS NOT NULL').get().count;
+
+  res.json({
+    autoSyncEnabled: suumoAutoSyncEnabled,
+    syncIntervalMinutes: SUUMO_AUTO_SYNC_INTERVAL / 1000 / 60,
+    totalProjects,
+    suumoProjects
+  });
+});
+
+// Batch sync all existing customers to Notion
+app.post('/api/notion/sync-all', async (req, res) => {
+  console.log('[API] Starting batch Notion sync for all existing customers...');
+
+  // Clear cache before batch sync to ensure fresh state
+  clearPropertyCache();
+
+  try {
+    // Get all SUUMO projects with requirements
+    const projects = db.prepare(`
+      SELECT id, name, user_requirements, suumo_customer_id
+      FROM projects
+      WHERE suumo_customer_id IS NOT NULL AND user_requirements IS NOT NULL
+    `).all();
+
+    console.log(`[Notion Batch] Found ${projects.length} SUUMO customers to sync`);
+
+    let synced = 0;
+    let created = 0;
+    let incremented = 0;
+    let failed = 0;
+
+    for (const project of projects) {
+      try {
+        // Parse property info from user_requirements
+        const requirements = project.user_requirements || '';
+        const propertyInfo = {};
+
+        // Extract fields from requirements text
+        const fieldMatches = requirements.match(/【([^】]+)】([^\n【]*)/g);
+        if (fieldMatches) {
+          for (const match of fieldMatches) {
+            const fieldMatch = match.match(/【([^】]+)】(.+)/);
+            if (fieldMatch) {
+              const key = fieldMatch[1].trim();
+              const value = fieldMatch[2].trim();
+              // Map field names
+              if (key === '物件名') propertyInfo['物件名'] = value;
+              else if (key === '物件種別') propertyInfo['物件種別'] = value;
+              else if (key === '所在地') propertyInfo['所在地'] = value;
+              else if (key === '最寄り駅') propertyInfo['最寄り駅'] = value;
+              else if (key === '徒歩') propertyInfo['バス／歩'] = value;
+              else if (key === '賃料') propertyInfo['賃料'] = value;
+              else if (key === '間取り') propertyInfo['間取り'] = value;
+              else if (key === '専有面積') propertyInfo['専有面積'] = value;
+              else if (key === '物件URL') propertyInfo['物件詳細画面'] = value;
+            }
+          }
+        }
+
+        if (propertyInfo['物件名']) {
+          const result = await syncPropertyToNotion(propertyInfo);
+          if (result.success) {
+            synced++;
+            if (result.action === 'created') created++;
+            else if (result.action === 'incremented') incremented++;
+            console.log(`[Notion Batch] ${result.action}: ${propertyInfo['物件名']} (反響数: ${result.newCount})`);
+          } else {
+            failed++;
+            console.log(`[Notion Batch] Failed: ${propertyInfo['物件名']} - ${result.reason}`);
+          }
+        }
+
+        // Small delay to avoid rate limiting
+        await new Promise(r => setTimeout(r, 500));
+      } catch (err) {
+        failed++;
+        console.error(`[Notion Batch] Error for project ${project.id}:`, err.message);
+      }
+    }
+
+    console.log(`[Notion Batch] Completed: ${synced} synced (${created} new, ${incremented} updated), ${failed} failed`);
+
+    res.json({
+      success: true,
+      message: `Notion同期完了: ${synced}件同期 (${created}件新規, ${incremented}件更新)`,
+      total: projects.length,
+      synced,
+      created,
+      incremented,
+      failed
+    });
+  } catch (error) {
+    console.error('[API] Notion batch sync error:', error.message);
+    res.status(500).json({ error: 'Notion同期に失敗しました', details: error.message });
+  }
+});
+
+// Clean up duplicate entries in Notion
+app.post('/api/notion/cleanup', async (req, res) => {
+  console.log('[API] Starting Notion duplicate cleanup...');
+
+  try {
+    const result = await cleanupDuplicates();
+
+    if (result.success) {
+      res.json({
+        success: true,
+        message: `重複整理完了: ${result.mergedGroups}グループを統合、${result.deletedPages}件の重複を削除`,
+        ...result
+      });
+    } else {
+      res.status(500).json({ error: '重複整理に失敗しました', details: result.reason });
+    }
+  } catch (error) {
+    console.error('[API] Notion cleanup error:', error.message);
+    res.status(500).json({ error: '重複整理に失敗しました', details: error.message });
+  }
+});
+
+// Toggle SUUMO auto-sync on/off
+app.post('/api/suumo/auto-sync', (req, res) => {
+  const { enabled } = req.body;
+
+  if (enabled === true) {
+    if (!suumoAutoSyncEnabled) {
+      startAutoSync(false); // Don't run initial sync when manually enabling
+      res.json({ success: true, autoSyncEnabled: true, message: '自動同期を有効にしました' });
+    } else {
+      res.json({ success: true, autoSyncEnabled: true, message: '自動同期は既に有効です' });
+    }
+  } else if (enabled === false) {
+    stopAutoSync();
+    res.json({ success: true, autoSyncEnabled: false, message: '自動同期を無効にしました' });
+  } else {
+    res.status(400).json({ error: 'enabled パラメータが必要です (true/false)' });
+  }
+});
+
 // Get customer list from SUUMO JDS
 app.get('/api/suumo/customers', async (req, res) => {
   try {
@@ -143,28 +456,58 @@ app.post('/api/suumo/import/:customerId', async (req, res) => {
     const { customerId } = req.params;
     const { customerData } = req.body;
 
+    // Check if this customer is already imported
+    const existingProject = db.prepare('SELECT id, name FROM projects WHERE suumo_customer_id = ?').get(customerId);
+    if (existingProject) {
+      return res.json({
+        projectId: existingProject.id,
+        name: existingProject.name,
+        alreadyExists: true,
+        message: 'この顧客は既にインポート済みです'
+      });
+    }
+
     console.log(`[API] Importing SUUMO customer ${customerId}...`);
 
     // Build requirements from customer data (already extracted from list)
     const details = await suumoScraper.getCustomerRequirements(customerId, customerData);
 
-    // Create new project
+    // Create new project with suumo_customer_id and inquiry date
     const projectId = uuidv4();
     const projectName = details.name || customerData?.name || `SUUMO顧客 ${customerId}`;
+    const createdAt = parseSuumoDate(details.inquiryDate);
 
-    db.prepare('INSERT INTO projects (id, name, user_requirements) VALUES (?, ?, ?)')
-      .run(projectId, projectName, details.requirements);
+    if (createdAt) {
+      db.prepare('INSERT INTO projects (id, name, user_requirements, suumo_customer_id, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run(projectId, projectName, details.requirements, customerId, createdAt);
+    } else {
+      db.prepare('INSERT INTO projects (id, name, user_requirements, suumo_customer_id) VALUES (?, ?, ?, ?)')
+        .run(projectId, projectName, details.requirements, customerId);
+    }
 
     // Create upload directory for this project
     fs.mkdirSync(path.join(__dirname, 'uploads', projectId), { recursive: true });
 
     console.log(`[API] Created project ${projectId} for customer ${details.name}`);
 
+    // Sync property info to Notion
+    let notionSyncResult = null;
+    if (details.rawDetails) {
+      const propertyInfo = extractPropertyInfo(details.rawDetails);
+      if (propertyInfo && propertyInfo['物件名']) {
+        notionSyncResult = await syncPropertyToNotion(propertyInfo);
+        if (notionSyncResult.success) {
+          console.log(`[API] Notion sync: ${notionSyncResult.action} "${propertyInfo['物件名']}" (反響数: ${notionSyncResult.newCount})`);
+        }
+      }
+    }
+
     res.json({
       projectId,
       name: projectName,
       requirements: details.requirements,
-      customerDetails: details
+      customerDetails: details,
+      notionSync: notionSyncResult
     });
   } catch (error) {
     console.error('[API] SUUMO import error:', error.message);
@@ -264,6 +607,7 @@ app.post('/api/projects/:projectId/search-properties', async (req, res) => {
       });
       formData.append('metadata', JSON.stringify({ project_id: projectId }));
       formData.append('build_immediately', 'true');
+      formData.append('user_id', projectId);
 
       const vectorResponse = await axios.post(
         `${VECTOR_SERVER}/api/v1/pdf/process`,
@@ -379,6 +723,7 @@ app.post('/api/projects/:projectId/upload', upload.array('files'), async (req, r
         });
         formData.append('metadata', JSON.stringify({ project_id: projectId }));
         formData.append('build_immediately', 'true');
+        formData.append('user_id', projectId);
 
         const vectorResponse = await axios.post(
           `${VECTOR_SERVER}/api/v1/pdf/process`,
@@ -624,7 +969,7 @@ async function generateRecommendations(projectId, round) {
         rating: mapRating(r.rating)
       }));
 
-      console.log(`[Vector] Calling /api/v1/recommend with ${ratingsForServer.length} ratings`);
+      console.log(`[Vector] Calling /api/v1/recommend with ${ratingsForServer.length} ratings, excluding ${recommendedHouseIds.length} already recommended`);
 
       const response = await fetch(`${VECTOR_SERVER}/api/v1/recommend`, {
         method: 'POST',
@@ -635,7 +980,9 @@ async function generateRecommendations(projectId, round) {
         body: JSON.stringify({
           ratings: ratingsForServer,
           limit: 10,
-          exclude_rated: true
+          exclude_rated: true,
+          exclude_page_ids: recommendedHouseIds,
+          user_id: projectId
         })
       });
 
@@ -828,4 +1175,11 @@ app.delete('/api/projects/:projectId', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
+
+  // Start SUUMO auto-sync if enabled by default
+  if (process.env.SUUMO_AUTO_SYNC !== 'false') {
+    startAutoSync();
+  } else {
+    console.log('[SUUMO Auto-Sync] Disabled via environment variable');
+  }
 });
