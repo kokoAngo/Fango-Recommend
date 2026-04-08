@@ -1,52 +1,31 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import axios from 'axios'
-
-interface House {
-  id: string
-  filename: string
-  content: string
-}
-
-interface Recommendation {
-  id: string
-  house_id: string
-  round: number
-  rating: string | null
-  notes: string
-  filename: string
-}
+import api from '../api'
 
 interface Project {
   id: string
   name: string
   created_at: string
   user_requirements: string
-  user_profile: string
-  current_round: number
-  houses: House[]
-  recommendations: Recommendation[]
 }
 
-interface RatingState {
-  [houseId: string]: {
-    rating: string | null
-    notes: string
-  }
+interface SearchResult {
+  reins_id: string
+  platform?: string
+  success: boolean
+  action?: string
 }
 
 function ProjectPage() {
   const { projectId } = useParams<{ projectId: string }>()
   const navigate = useNavigate()
   const [project, setProject] = useState<Project | null>(null)
-  const [currentTab, setCurrentTab] = useState(-1) // -1 = 基本情報, 0 = ランダム選択, 1-3 = 推薦ラウンド
-  const [roundHouses, setRoundHouses] = useState<House[]>([])
-  const [ratings, setRatings] = useState<RatingState>({})
   const [loading, setLoading] = useState(true)
-  const [processing, setProcessing] = useState(false)
-  const [editingRequirements, setEditingRequirements] = useState(false)
   const [requirementsText, setRequirementsText] = useState('')
   const [searchingProperties, setSearchingProperties] = useState(false)
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([])
+  const [saving, setSaving] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     if (projectId) {
@@ -54,23 +33,11 @@ function ProjectPage() {
     }
   }, [projectId])
 
-  useEffect(() => {
-    if (project && currentTab >= 0) {
-      fetchRoundData(currentTab)
-    }
-  }, [currentTab, project?.id])
-
   const fetchProject = async () => {
     try {
-      const res = await axios.get(`/api/projects/${projectId}`)
+      const res = await api.get(`/api/projects/${projectId}`)
       setProject(res.data)
       setRequirementsText(res.data.user_requirements || '')
-      // Start at 基本情報 tab if no rounds started, otherwise go to current round
-      if (res.data.current_round === 0 && (!res.data.recommendations || res.data.recommendations.length === 0)) {
-        setCurrentTab(-1)
-      } else {
-        setCurrentTab(res.data.current_round)
-      }
       setLoading(false)
     } catch (err) {
       console.error('Failed to fetch project:', err)
@@ -78,156 +45,91 @@ function ProjectPage() {
     }
   }
 
-  const fetchRoundData = async (round: number) => {
-    try {
-      const res = await axios.get(`/api/projects/${projectId}/rounds/${round}`)
-      const recs = res.data.recommendations as Recommendation[]
-
-      // Extract houses from recommendations
-      const houses = recs.map(r => ({
-        id: r.house_id,
-        filename: r.filename,
-        content: ''
-      }))
-      setRoundHouses(houses)
-
-      // Initialize ratings from existing data
-      const initialRatings: RatingState = {}
-      recs.forEach(r => {
-        initialRatings[r.house_id] = {
-          rating: r.rating,
-          notes: r.notes || ''
-        }
-      })
-      setRatings(initialRatings)
-    } catch (err) {
-      console.error('Failed to fetch round data:', err)
-      setRoundHouses([])
-    }
-  }
-
-  const startRandomSample = async () => {
-    setProcessing(true)
-    try {
-      const res = await axios.post(`/api/projects/${projectId}/random-sample`)
-      setRoundHouses(res.data.houses)
-      // Initialize empty ratings
-      const initialRatings: RatingState = {}
-      res.data.houses.forEach((h: House) => {
-        initialRatings[h.id] = { rating: null, notes: '' }
-      })
-      setRatings(initialRatings)
-    } catch (err) {
-      console.error('Failed to get random sample:', err)
-      alert('ランダムサンプルの取得に失敗しました')
-    } finally {
-      setProcessing(false)
-    }
-  }
-
-  const handleRatingChange = (houseId: string, rating: string) => {
-    setRatings(prev => ({
-      ...prev,
-      [houseId]: {
-        ...prev[houseId],
-        rating: prev[houseId]?.rating === rating ? null : rating
-      }
-    }))
-  }
-
-  const submitRatingsAndNextRound = async () => {
-    // Check if all houses are rated
-    const allRated = roundHouses.every(h => ratings[h.id]?.rating)
-    if (!allRated) {
-      alert('すべての物件を評価してください')
+  const saveRequirements = async () => {
+    if (!requirementsText.trim()) {
+      alert('要望を入力してください')
       return
     }
 
-    setProcessing(true)
+    setSaving(true)
     try {
-      // Submit ratings
-      const ratingsData = roundHouses.map(h => ({
-        houseId: h.id,
-        rating: ratings[h.id].rating,
-        notes: ratings[h.id].notes
-      }))
-
-      await axios.post(`/api/projects/${projectId}/rate`, {
-        ratings: ratingsData,
-        round: currentTab
+      await api.put(`/api/projects/${projectId}/requirements`, {
+        requirements: requirementsText
       })
-
-      if (currentTab < 3) {
-        // Get next round recommendations
-        const res = await axios.post(`/api/projects/${projectId}/next-round`)
-        setRoundHouses(res.data.houses)
-
-        // Initialize ratings for new houses
-        const initialRatings: RatingState = {}
-        res.data.houses.forEach((h: House) => {
-          initialRatings[h.id] = { rating: null, notes: '' }
-        })
-        setRatings(initialRatings)
-
-        // Move to next tab
-        setCurrentTab(prev => prev + 1)
-        await fetchProject() // Refresh project data
-      } else {
-        alert('推薦プロセスが完了しました')
-        await fetchProject()
-      }
+      setProject(prev => prev ? { ...prev, user_requirements: requirementsText } : null)
+      alert('保存しました')
     } catch (err) {
-      console.error('Failed to process:', err)
-      alert('処理に失敗しました')
+      console.error('Failed to save:', err)
+      alert('保存に失敗しました')
     } finally {
-      setProcessing(false)
+      setSaving(false)
     }
   }
 
-  const downloadAll = () => {
-    window.open(`/api/projects/${projectId}/download/${currentTab}`, '_blank')
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    if (!file.name.endsWith('.txt')) {
+      alert('TXTファイルのみ対応しています')
+      return
+    }
+
+    try {
+      const text = await file.text()
+      setRequirementsText(prev => prev ? prev + '\n\n' + text : text)
+    } catch (err) {
+      console.error('Failed to read file:', err)
+      alert('ファイルの読み込みに失敗しました')
+    }
+
+    // Reset file input
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
   }
 
   const searchProperties = async () => {
-    if (!project?.user_requirements) {
+    if (!requirementsText.trim()) {
       alert('お客様の要望を入力してください')
       return
     }
 
+    // Save requirements first if changed
+    if (requirementsText !== project?.user_requirements) {
+      await saveRequirements()
+    }
+
     setSearchingProperties(true)
+    setSearchResults([])
     try {
-      const res = await axios.post(`/api/projects/${projectId}/search-properties`, {
-        userRequirements: project.user_requirements
+      const res = await api.post(`/api/projects/${projectId}/search-properties`, {
+        userRequirements: requirementsText
+      }, {
+        timeout: 600000 // 10 minutes timeout
       })
-      alert(res.data.message || '物件を取得しました')
-      await fetchProject() // Refresh to show new houses
+
+      // Store search results (REINS IDs)
+      if (res.data.notionSyncResults) {
+        setSearchResults(res.data.notionSyncResults)
+      }
+
+      alert(res.data.message || '検索完了')
     } catch (err: any) {
       console.error('Failed to search properties:', err)
-      const errorMsg = err.response?.data?.error || err.response?.data?.details || '物件検索に失敗しました'
+      const status = err.response?.status
+      const data = err.response?.data
+      let errorMsg: string
+      if (status === 503) {
+        errorMsg = `${data?.error || '物件検索APIに接続できません'}\n\n${data?.details || '外部APIが起動しているか確認してください。'}`
+      } else if (status === 502) {
+        errorMsg = `${data?.error || 'APIエンドポイントエラー'}\n\n${data?.details || 'API設定を確認してください。'}`
+      } else {
+        errorMsg = data?.error || data?.details || '物件検索に失敗しました'
+      }
       alert(errorMsg)
     } finally {
       setSearchingProperties(false)
-    }
-  }
-
-  const getTabLabel = (round: number) => {
-    switch (round) {
-      case -1: return '基本情報'
-      case 0: return 'ランダム選択'
-      case 1: return '第1ラウンド推薦'
-      case 2: return '第2ラウンド推薦'
-      case 3: return '第3ラウンド推薦'
-      default: return ''
-    }
-  }
-
-  const getNextButtonLabel = (round: number) => {
-    switch (round) {
-      case 0: return '第1ラウンド推薦へ'
-      case 1: return '第2ラウンド推薦へ'
-      case 2: return '第3ラウンド推薦へ'
-      case 3: return '完了'
-      default: return ''
     }
   }
 
@@ -255,7 +157,7 @@ function ProjectPage() {
     <>
       <header className="header">
         <h1>{project.name}</h1>
-        <p>AI駆動の物件推薦システム</p>
+        <p>物件推薦システム - Notion連携</p>
       </header>
 
       <button
@@ -266,259 +168,166 @@ function ProjectPage() {
         ← ホームに戻る
       </button>
 
-      {/* Tabs */}
-      <div className="tabs">
-        {[-1, 0, 1, 2, 3].map(round => (
+      {/* User Requirements Input */}
+      <div className="card">
+        <h3 style={{ marginBottom: '20px' }}>お客様の要望</h3>
+
+        <div style={{ marginBottom: '15px' }}>
+          <label style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold' }}>
+            要望を入力またはTXTファイルをアップロード
+          </label>
+          <textarea
+            className="textarea"
+            style={{
+              minHeight: '250px',
+              fontFamily: 'monospace',
+              fontSize: '0.9rem',
+              lineHeight: '1.6'
+            }}
+            value={requirementsText}
+            onChange={(e) => setRequirementsText(e.target.value)}
+            placeholder="お客様の要望を入力してください...
+
+例:
+- 場所: 東京都新宿区周辺
+- 予算: 月額15万円以下
+- 間取り: 1LDK以上
+- 駅徒歩: 10分以内
+- その他: ペット可、バストイレ別"
+          />
+        </div>
+
+        <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
           <button
-            key={round}
-            className={`tab ${currentTab === round ? 'active' : ''}`}
-            onClick={() => setCurrentTab(round)}
-            disabled={round > project.current_round && round !== -1}
+            className="btn btn-secondary"
+            onClick={() => fileInputRef.current?.click()}
           >
-            {getTabLabel(round)}
+            📄 TXTファイルを追加
           </button>
-        ))}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".txt"
+            style={{ display: 'none' }}
+            onChange={handleFileUpload}
+          />
+
+          <button
+            className="btn btn-primary"
+            onClick={saveRequirements}
+            disabled={saving || !requirementsText.trim()}
+          >
+            {saving ? '保存中...' : '保存'}
+          </button>
+
+          <button
+            className="btn btn-secondary"
+            onClick={() => setRequirementsText('')}
+            disabled={!requirementsText}
+          >
+            クリア
+          </button>
+        </div>
       </div>
 
-      {/* 基本情報 Tab Content */}
-      {currentTab === -1 && (
-        <div className="card">
-          <h3 style={{ marginBottom: '20px' }}>お客様基本情報</h3>
+      {/* Search Section */}
+      <div className="card" style={{ marginTop: '20px', background: '#e8f5e9' }}>
+        <h3 style={{ marginBottom: '15px', color: '#2e7d32' }}>🔍 物件を検索</h3>
+        <p style={{ fontSize: '0.9rem', color: '#666', marginBottom: '15px' }}>
+          上記の要望に基づいてFangoで物件を検索し、REINS IDをNotionに記録します。
+        </p>
 
-          {editingRequirements ? (
-            <>
-              <textarea
-                className="textarea"
-                style={{ minHeight: '300px', fontFamily: 'monospace', fontSize: '0.9rem' }}
-                value={requirementsText}
-                onChange={(e) => setRequirementsText(e.target.value)}
-                placeholder="お客様の基本情報を入力..."
-              />
-              <div style={{ display: 'flex', gap: '10px', marginTop: '15px' }}>
-                <button
-                  className="btn btn-primary"
-                  onClick={async () => {
-                    try {
-                      await axios.put(`/api/projects/${projectId}/requirements`, {
-                        requirements: requirementsText
-                      })
-                      setProject(prev => prev ? { ...prev, user_requirements: requirementsText } : null)
-                      setEditingRequirements(false)
-                      alert('保存しました')
-                    } catch (err) {
-                      console.error('Failed to save:', err)
-                      alert('保存に失敗しました')
-                    }
-                  }}
-                >
-                  保存
-                </button>
-                <button
-                  className="btn btn-secondary"
-                  onClick={() => {
-                    setRequirementsText(project.user_requirements || '')
-                    setEditingRequirements(false)
-                  }}
-                >
-                  キャンセル
-                </button>
-              </div>
-            </>
-          ) : (
-            <>
-              <div style={{
-                background: '#f8f9fa',
-                padding: '20px',
-                borderRadius: '8px',
-                whiteSpace: 'pre-wrap',
-                fontFamily: 'monospace',
-                fontSize: '0.9rem',
-                lineHeight: '1.8',
-                minHeight: '200px'
-              }}>
-                {project.user_requirements || '（情報なし）'}
-              </div>
-              <button
-                className="btn btn-secondary"
-                style={{ marginTop: '15px' }}
-                onClick={() => setEditingRequirements(true)}
-              >
-                編集
-              </button>
-            </>
-          )}
-
-          {/* Property Search Section */}
-          <div style={{
-            marginTop: '30px',
-            padding: '20px',
-            background: '#e8f5e9',
-            borderRadius: '8px'
-          }}>
-            <h4 style={{ marginBottom: '15px', color: '#2e7d32' }}>🔍 物件を検索</h4>
-            <p style={{ fontSize: '0.9rem', color: '#666', marginBottom: '15px' }}>
-              お客様の要望に基づいて、外部APIから物件PDFを自動取得します。
-            </p>
-            <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
-              <button
-                className="btn btn-primary"
-                style={{ background: '#2e7d32' }}
-                onClick={searchProperties}
-                disabled={searchingProperties || !project.user_requirements}
-              >
-                {searchingProperties ? '検索中...' : '物件を検索して取得'}
-              </button>
-              {project.houses.length > 0 && (
-                <span style={{ fontSize: '0.9rem', color: '#666' }}>
-                  現在 {project.houses.length} 件の物件があります
-                </span>
-              )}
-            </div>
-          </div>
-
-          <div style={{ marginTop: '30px', textAlign: 'center' }}>
-            <p style={{ color: '#666', marginBottom: '15px' }}>
-              {project.houses.length > 0
-                ? '物件の準備ができました。ランダム選択に進んでください。'
-                : '物件を検索するか、PDFをアップロードしてください。'}
-            </p>
-            <button
-              className="btn btn-primary"
-              onClick={() => setCurrentTab(0)}
-              disabled={project.houses.length === 0}
-            >
-              ランダム選択へ進む →
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Requirements Section (shown on other tabs) */}
-      {currentTab >= 0 && project.user_requirements && (
-        <div className="requirements-section">
-          <h3>お客様の要望</h3>
-          <p style={{ whiteSpace: 'pre-wrap' }}>{project.user_requirements}</p>
-        </div>
-      )}
-
-      {/* User Profile (if analyzed) */}
-      {project.user_profile && currentTab > 0 && (
-        <div className="requirements-section" style={{ background: '#fff8e1' }}>
-          <h3>ユーザープロフィール分析</h3>
-          <p style={{ whiteSpace: 'pre-wrap' }}>{project.user_profile}</p>
-        </div>
-      )}
-
-      {/* Initial Random Sample Start */}
-      {currentTab === 0 && roundHouses.length === 0 && (
-        <div className="card" style={{ textAlign: 'center' }}>
-          <h3 style={{ marginBottom: '20px' }}>ランダムサンプリングを開始</h3>
-          <p style={{ marginBottom: '20px', color: '#666' }}>
-            アップロードされた{project.houses.length}件の物件から10件をランダムに選択します
-          </p>
-          {project.houses.length === 0 ? (
-            <p style={{ color: '#dc2626' }}>
-              まず物件PDFをアップロードしてください
-            </p>
-          ) : (
-            <button
-              className="btn btn-primary"
-              onClick={startRandomSample}
-              disabled={processing}
-            >
-              {processing ? '処理中...' : 'ランダム選択を開始'}
-            </button>
-          )}
-        </div>
-      )}
-
-      {/* Houses Grid */}
-      {currentTab >= 0 && roundHouses.length > 0 && (
-        <div className="houses-grid">
-          {roundHouses.map((house) => (
-            <div key={house.id} className="house-card">
-              <div className="house-pdf">
-                <iframe
-                  src={`/uploads/${projectId}/${encodeURIComponent(house.filename)}`}
-                  title={house.filename}
-                />
-              </div>
-              <div className="house-rating">
-                <h4>{house.filename}</h4>
-
-                <label
-                  className={`rating-option good ${ratings[house.id]?.rating === 'good' ? 'selected' : ''}`}
-                  onClick={() => handleRatingChange(house.id, 'good')}
-                >
-                  <span style={{ fontSize: '1.2rem' }}>👍</span>
-                  良い
-                </label>
-
-                <label
-                  className={`rating-option question ${ratings[house.id]?.rating === 'question' ? 'selected' : ''}`}
-                  onClick={() => handleRatingChange(house.id, 'question')}
-                >
-                  <span style={{ fontSize: '1.2rem' }}>🤔</span>
-                  疑問
-                </label>
-
-                <label
-                  className={`rating-option bad ${ratings[house.id]?.rating === 'bad' ? 'selected' : ''}`}
-                  onClick={() => handleRatingChange(house.id, 'bad')}
-                >
-                  <span style={{ fontSize: '1.2rem' }}>👎</span>
-                  悪い
-                </label>
-
-                <textarea
-                  className="textarea"
-                  style={{ marginTop: '10px', minHeight: '60px' }}
-                  placeholder="メモ（任意）"
-                  value={ratings[house.id]?.notes || ''}
-                  onChange={(e) => setRatings(prev => ({
-                    ...prev,
-                    [house.id]: {
-                      ...prev[house.id],
-                      notes: e.target.value
-                    }
-                  }))}
-                />
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Action Bar */}
-      {currentTab >= 0 && roundHouses.length > 0 && (
-        <div className="action-bar">
-          <button className="btn btn-secondary" onClick={downloadAll}>
-            一括ダウンロード
+        <div style={{ display: 'flex', gap: '15px', alignItems: 'center' }}>
+          <button
+            className="btn btn-primary"
+            style={{ background: '#2e7d32', padding: '12px 24px', fontSize: '1rem' }}
+            onClick={searchProperties}
+            disabled={searchingProperties || !requirementsText.trim()}
+          >
+            {searchingProperties ? '検索中...' : 'REINS IDを検索してNotionに記録'}
           </button>
-
-          {currentTab <= 3 && currentTab === project.current_round && (
-            <button
-              className="btn btn-primary"
-              onClick={submitRatingsAndNextRound}
-              disabled={processing}
-            >
-              {processing ? (
-                '処理中...'
-              ) : currentTab === 3 ? (
-                '評価を保存して完了'
-              ) : (
-                getNextButtonLabel(currentTab)
-              )}
-            </button>
-          )}
         </div>
-      )}
+
+        {/* Search Results */}
+        {searchResults.length > 0 && (
+          <div style={{ marginTop: '25px' }}>
+            <h4 style={{ marginBottom: '15px', color: '#2e7d32' }}>📋 検索結果</h4>
+            <div style={{
+              background: '#fff',
+              borderRadius: '8px',
+              overflow: 'hidden',
+              border: '1px solid #ddd'
+            }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr style={{ background: '#f5f5f5' }}>
+                    <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #ddd' }}>#</th>
+                    <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #ddd' }}>REINS ID</th>
+                    <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #ddd' }}>User ID</th>
+                    <th style={{ padding: '12px', textAlign: 'center', borderBottom: '2px solid #ddd' }}>Notion同期</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {searchResults.map((result, index) => (
+                    <tr key={`${result.reins_id}-${index}`} style={{ borderBottom: '1px solid #eee' }}>
+                      <td style={{ padding: '12px', color: '#666' }}>{index + 1}</td>
+                      <td style={{ padding: '12px', fontFamily: 'monospace', fontWeight: 'bold', fontSize: '1rem' }}>
+                        {result.reins_id}
+                      </td>
+                      <td style={{ padding: '12px', fontFamily: 'monospace', fontSize: '0.85rem', color: '#666' }}>
+                        {projectId?.substring(0, 8)}...
+                      </td>
+                      <td style={{ padding: '12px', textAlign: 'center' }}>
+                        {result.success ? (
+                          <span style={{ color: '#2e7d32', fontWeight: 'bold' }}>✅ {result.action}</span>
+                        ) : (
+                          <span style={{ color: '#d32f2f' }}>❌ 失敗</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div style={{
+              marginTop: '15px',
+              padding: '12px',
+              background: '#fff',
+              borderRadius: '8px',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center'
+            }}>
+              <span style={{ fontSize: '0.9rem', color: '#666' }}>
+                {searchResults.filter(r => r.success).length} / {searchResults.length} 件がNotionに同期されました
+              </span>
+              <a
+                href="https://www.notion.so/angojp/33b1c1974dad8048add5c41c7ead9c13"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: '#2e7d32', textDecoration: 'none', fontWeight: 'bold' }}
+              >
+                Notionで確認 →
+              </a>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Project Info */}
+      <div className="card" style={{ marginTop: '20px', background: '#f5f5f5' }}>
+        <h4 style={{ marginBottom: '10px', color: '#666' }}>プロジェクト情報</h4>
+        <p style={{ fontSize: '0.85rem', color: '#888' }}>
+          <strong>Project ID:</strong> {projectId}<br />
+          <strong>作成日:</strong> {project.created_at}
+        </p>
+      </div>
 
       {/* Processing Indicator */}
-      {processing && (
+      {searchingProperties && (
         <div className="loading" style={{ marginTop: '30px' }}>
           <div className="loading-spinner"></div>
-          <p>AIが分析中です。しばらくお待ちください...</p>
+          <p>Fangoで物件を検索中...</p>
         </div>
       )}
     </>

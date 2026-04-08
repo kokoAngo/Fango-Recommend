@@ -3,6 +3,7 @@ import { Client } from '@notionhq/client';
 // Notion configuration from environment variables
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
 const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID || '30b1c1974dad80ec9ea3d63db4c0ace9';
+const NOTION_RECOMMENDATION_DB_ID = process.env.NOTION_RECOMMENDATION_DB_ID || '33b1c1974dad8048add5c41c7ead9c13';
 
 let notion = null;
 
@@ -374,9 +375,203 @@ export async function cleanupDuplicates() {
   }
 }
 
+// ============ Recommendation Sync Functions ============
+
+/**
+ * Find existing recommendation in Notion by REINS ID and project ID
+ * Note: Database has properties: "Reins ID" (title), "User ID" (rich_text)
+ * Uses search API since databases.query is not available in this version
+ */
+async function findExistingRecommendation(reinsId, projectId) {
+  if (!initNotion()) return null;
+
+  try {
+    // Use search API to find pages with the REINS ID
+    const response = await notion.search({
+      query: reinsId,
+      filter: {
+        property: 'object',
+        value: 'page'
+      },
+      page_size: 50
+    });
+
+    // Filter results to find exact match in our database
+    const dbId = NOTION_RECOMMENDATION_DB_ID.replace(/-/g, '');
+    for (const page of response.results) {
+      const pageDbId = page.parent?.database_id?.replace(/-/g, '');
+      if (pageDbId !== dbId) continue;
+
+      // Check if REINS ID and User ID match
+      const pageReinsId = page.properties['Reins ID']?.title?.[0]?.plain_text;
+      const pageUserId = page.properties['User ID']?.rich_text?.[0]?.plain_text;
+
+      if (pageReinsId === reinsId && pageUserId === projectId) {
+        return page;
+      }
+    }
+
+    return null;
+  } catch (error) {
+    console.error('[Notion Recommendation] Search error:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Create recommendation entry in Notion
+ * Note: Database has properties: "Reins ID" (title), "User ID" (rich_text)
+ */
+async function createRecommendationEntry(recInfo) {
+  if (!initNotion()) return null;
+
+  try {
+    const properties = {
+      'Reins ID': {
+        title: [{ text: { content: recInfo.reins_id || '不明' } }]
+      },
+      'User ID': {
+        rich_text: [{ text: { content: recInfo.project_id || recInfo.user_name || '' } }]
+      }
+    };
+
+    console.log(`[Notion Recommendation] Creating entry for REINS ID: ${recInfo.reins_id}, User ID: ${recInfo.project_id}`);
+
+    const response = await notion.pages.create({
+      parent: { database_id: NOTION_RECOMMENDATION_DB_ID },
+      properties: properties
+    });
+
+    console.log(`[Notion Recommendation] Created entry: ${recInfo.reins_id}`);
+    return response;
+  } catch (error) {
+    console.error('[Notion Recommendation] Create error:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Update recommendation entry in Notion (e.g., update rating)
+ */
+async function updateRecommendationEntry(pageId, updates) {
+  if (!initNotion()) return false;
+
+  try {
+    const properties = {};
+
+    if (updates.rating) {
+      properties['評価'] = {
+        select: { name: updates.rating }
+      };
+    }
+
+    if (updates.round !== undefined) {
+      properties['ラウンド'] = {
+        number: updates.round
+      };
+    }
+
+    await notion.pages.update({
+      page_id: pageId,
+      properties: properties
+    });
+
+    console.log(`[Notion Recommendation] Updated entry: ${pageId}`);
+    return true;
+  } catch (error) {
+    console.error('[Notion Recommendation] Update error:', error.message);
+    return false;
+  }
+}
+
+/**
+ * Sync recommendation to Notion
+ * - If exists, update rating
+ * - If new, create entry
+ *
+ * @param {Object} recInfo - Recommendation info
+ * @param {string} recInfo.reins_id - REINS property ID
+ * @param {string} recInfo.project_id - Project ID
+ * @param {string} recInfo.user_name - User/Project name
+ * @param {string} recInfo.platform - Platform (atbb, itandi, reins, etc.)
+ * @param {number} recInfo.round - Recommendation round (0-3)
+ * @param {string} recInfo.rating - Rating (good, question, bad)
+ * @param {string} recInfo.location - Property location
+ * @param {string} recInfo.rent - Rent amount
+ * @param {string} recInfo.layout - Layout (間取り)
+ */
+export async function syncRecommendationToNotion(recInfo) {
+  if (!NOTION_API_KEY) {
+    return { success: false, reason: 'NOTION_API_KEY not configured' };
+  }
+
+  if (!recInfo || !recInfo.reins_id) {
+    return { success: false, reason: 'No REINS ID provided' };
+  }
+
+  console.log(`[Notion Recommendation] Syncing: ${recInfo.reins_id} for project ${recInfo.project_id}`);
+
+  try {
+    // Check if recommendation already exists
+    const existing = await findExistingRecommendation(recInfo.reins_id, recInfo.project_id);
+
+    if (existing) {
+      // Update existing entry
+      const success = await updateRecommendationEntry(existing.id, {
+        rating: recInfo.rating,
+        round: recInfo.round
+      });
+
+      return {
+        success,
+        action: 'updated',
+        reins_id: recInfo.reins_id
+      };
+    } else {
+      // Create new entry
+      const newPage = await createRecommendationEntry(recInfo);
+
+      return {
+        success: !!newPage,
+        action: 'created',
+        reins_id: recInfo.reins_id
+      };
+    }
+  } catch (error) {
+    console.error('[Notion Recommendation] Sync error:', error.message);
+    return { success: false, reason: error.message };
+  }
+}
+
+/**
+ * Batch sync recommendations to Notion
+ */
+export async function batchSyncRecommendationsToNotion(recommendations) {
+  const results = [];
+
+  for (const rec of recommendations) {
+    const result = await syncRecommendationToNotion(rec);
+    results.push(result);
+
+    // Small delay to avoid rate limiting
+    await new Promise(r => setTimeout(r, 200));
+  }
+
+  const successCount = results.filter(r => r.success).length;
+  console.log(`[Notion Recommendation] Batch sync: ${successCount}/${recommendations.length} succeeded`);
+
+  return {
+    total: recommendations.length,
+    success: successCount,
+    results
+  };
+}
+
 export default {
   syncPropertyToNotion,
   extractPropertyInfo,
   clearPropertyCache,
-  cleanupDuplicates
+  cleanupDuplicates,
+  syncRecommendationToNotion,
+  batchSyncRecommendationsToNotion
 };

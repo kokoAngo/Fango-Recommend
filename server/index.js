@@ -14,10 +14,15 @@ import { PDFDocument } from 'pdf-lib';
 import FormData from 'form-data';
 import axios from 'axios';
 import suumoScraper from './suumo-scraper.js';
-import { syncPropertyToNotion, extractPropertyInfo, clearPropertyCache, cleanupDuplicates } from './notion-sync.js';
+import { syncPropertyToNotion, extractPropertyInfo, clearPropertyCache, cleanupDuplicates, syncRecommendationToNotion } from './notion-sync.js';
+import crypto from 'crypto';
+import lineHandler from './line-handler.js';
+import createAuth from './auth.js';
+import bcrypt from 'bcryptjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
 
 const app = express();
 const PORT = 3002;
@@ -43,7 +48,17 @@ console.log(`External API: ${EXTERNAL_API_URL}`);
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+// Skip JSON parsing for LINE webhook (needs raw body for signature verification)
+app.use((req, res, next) => {
+  if (req.path === '/api/line/webhook') {
+    return next();
+  }
+  express.json()(req, res, next);
+});
+
+// Auth - initialized after db setup, wrapper allows deferred binding
+let _authMiddleware, _loginHandler;
+app.use((req, res, next) => _authMiddleware ? _authMiddleware(req, res, next) : next());
 
 // File upload configuration
 const storage = multer.diskStorage({
@@ -72,6 +87,15 @@ const db = new Database(path.join(__dirname, 'fango.db'));
 
 // Initialize database tables
 db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    display_name TEXT,
+    role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin', 'user')),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
   CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -115,6 +139,107 @@ try {
   db.exec('CREATE INDEX IF NOT EXISTS idx_projects_suumo_customer_id ON projects(suumo_customer_id)');
 } catch (e) {
   // Index creation failed, ignore
+}
+
+// Add owner_id column to projects if not exists
+try {
+  db.exec('ALTER TABLE projects ADD COLUMN owner_id TEXT REFERENCES users(id)');
+  console.log('Added owner_id column to projects table');
+} catch (e) {
+  // Column already exists
+}
+
+try {
+  db.exec('CREATE INDEX IF NOT EXISTS idx_projects_owner_id ON projects(owner_id)');
+} catch (e) {
+  // Index creation failed
+}
+
+// Seed admin user from .env
+(function seedAdminUser() {
+  const adminUsername = process.env.ADMIN_USER || 'admin';
+  const adminPass = process.env.ADMIN_PASS || 'admin';
+  const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(adminUsername);
+  if (!existing) {
+    const id = uuidv4();
+    const hash = bcrypt.hashSync(adminPass, 10);
+    db.prepare('INSERT INTO users (id, username, password_hash, display_name, role) VALUES (?, ?, ?, ?, ?)')
+      .run(id, adminUsername, hash, '管理者', 'admin');
+    console.log(`Seeded admin user: ${adminUsername}`);
+    // Assign all existing projects to admin
+    db.prepare('UPDATE projects SET owner_id = ? WHERE owner_id IS NULL').run(id);
+    console.log('Assigned existing projects to admin user');
+  }
+})();
+
+// ============ LINE Integration Database Setup ============
+// Add line_user_id and source columns if not exists
+try {
+  db.exec('ALTER TABLE projects ADD COLUMN line_user_id TEXT');
+  console.log('Added line_user_id column to projects table');
+} catch (e) {
+  // Column already exists
+}
+
+try {
+  db.exec("ALTER TABLE projects ADD COLUMN source TEXT DEFAULT 'manual'");
+  console.log('Added source column to projects table');
+} catch (e) {
+  // Column already exists
+}
+
+try {
+  db.exec('CREATE INDEX IF NOT EXISTS idx_projects_line_user_id ON projects(line_user_id)');
+} catch (e) {
+  // Index creation failed
+}
+
+// Create line_conversations table
+db.exec(`
+  CREATE TABLE IF NOT EXISTS line_conversations (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    line_user_id TEXT NOT NULL,
+    message_type TEXT NOT NULL,
+    message_content TEXT,
+    sender TEXT NOT NULL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (project_id) REFERENCES projects(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_line_conversations_project ON line_conversations(project_id);
+  CREATE INDEX IF NOT EXISTS idx_line_conversations_user ON line_conversations(line_user_id);
+`);
+
+// ============ REINS ID Database Setup ============
+// Add reins_id column to houses table if not exists
+try {
+  db.exec('ALTER TABLE houses ADD COLUMN reins_id TEXT');
+  console.log('Added reins_id column to houses table');
+} catch (e) {
+  // Column already exists
+}
+
+// Add platform column to houses table if not exists
+try {
+  db.exec('ALTER TABLE houses ADD COLUMN platform TEXT');
+  console.log('Added platform column to houses table');
+} catch (e) {
+  // Column already exists
+}
+
+// Create index for reins_id
+try {
+  db.exec('CREATE INDEX IF NOT EXISTS idx_houses_reins_id ON houses(reins_id)');
+} catch (e) {
+  // Index creation failed
+}
+
+// LINE configuration check
+const LINE_ENABLED = lineHandler.isLineConfigured();
+if (LINE_ENABLED) {
+  console.log('[LINE] Webhook integration enabled');
+} else {
+  console.warn('[LINE] Missing credentials, LINE integration disabled');
 }
 
 // ============ SUUMO Auto-Sync Configuration ============
@@ -168,13 +293,14 @@ async function autoSyncSuumoCustomers() {
         const projectId = uuidv4();
         const projectName = details.name || customer.name || `SUUMO顧客 ${customer.id}`;
         const createdAt = parseSuumoDate(details.inquiryDate);
+        const adminId = getAdminUserId();
 
         if (createdAt) {
-          db.prepare('INSERT INTO projects (id, name, user_requirements, suumo_customer_id, created_at) VALUES (?, ?, ?, ?, ?)')
-            .run(projectId, projectName, details.requirements, customer.id, createdAt);
+          db.prepare('INSERT INTO projects (id, name, user_requirements, suumo_customer_id, created_at, owner_id) VALUES (?, ?, ?, ?, ?, ?)')
+            .run(projectId, projectName, details.requirements, customer.id, createdAt, adminId);
         } else {
-          db.prepare('INSERT INTO projects (id, name, user_requirements, suumo_customer_id) VALUES (?, ?, ?, ?)')
-            .run(projectId, projectName, details.requirements, customer.id);
+          db.prepare('INSERT INTO projects (id, name, user_requirements, suumo_customer_id, owner_id) VALUES (?, ?, ?, ?, ?)')
+            .run(projectId, projectName, details.requirements, customer.id, adminId);
         }
 
         // Create upload directory
@@ -255,14 +381,99 @@ function stopAutoSync() {
   console.log('[SUUMO Auto-Sync] Stopped');
 }
 
+// Initialize auth (after db is ready)
+const auth = createAuth(db);
+_authMiddleware = auth.authMiddleware;
+_loginHandler = auth.loginHandler;
+app.post('/api/auth/login', (req, res) => _loginHandler(req, res));
+
+// Get current user info
+app.get('/api/auth/me', (req, res) => {
+  const user = db.prepare('SELECT id, username, display_name, role, created_at FROM users WHERE id = ?').get(req.user.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  res.json(user);
+});
+
+// Helper: admin-only guard
+function requireAdmin(req, res, next) {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: '管理者権限が必要です' });
+  }
+  next();
+}
+
+// Helper: project ownership check
+function requireProjectAccess(req, res, next) {
+  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
+  if (!project) {
+    return res.status(404).json({ error: 'Project not found' });
+  }
+  if (req.user.role !== 'admin' && project.owner_id !== req.user.id) {
+    return res.status(403).json({ error: 'アクセス権限がありません' });
+  }
+  req.project = project;
+  next();
+}
+
+// Helper: get admin user id (for background jobs)
+function getAdminUserId() {
+  const admin = db.prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1").get();
+  return admin?.id;
+}
+
+// ============ User Management APIs (admin only) ============
+app.get('/api/users', requireAdmin, (req, res) => {
+  const users = db.prepare('SELECT id, username, display_name, role, created_at FROM users').all();
+  for (const user of users) {
+    user.projectCount = db.prepare('SELECT COUNT(*) as count FROM projects WHERE owner_id = ?').get(user.id).count;
+  }
+  res.json(users);
+});
+
+app.post('/api/users', requireAdmin, (req, res) => {
+  const { username, password, displayName, role } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'ユーザー名とパスワードは必須です' });
+  }
+  const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+  if (existing) {
+    return res.status(409).json({ error: 'このユーザー名は既に使用されています' });
+  }
+  const id = uuidv4();
+  const hash = bcrypt.hashSync(password, 10);
+  db.prepare('INSERT INTO users (id, username, password_hash, display_name, role) VALUES (?, ?, ?, ?, ?)')
+    .run(id, username, hash, displayName || username, role || 'user');
+  res.json({ id, username, displayName: displayName || username, role: role || 'user' });
+});
+
+app.delete('/api/users/:id', requireAdmin, (req, res) => {
+  const { id } = req.params;
+  if (id === req.user.id) {
+    return res.status(400).json({ error: '自分自身は削除できません' });
+  }
+  const adminCount = db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'admin'").get().count;
+  const targetUser = db.prepare('SELECT role FROM users WHERE id = ?').get(id);
+  if (!targetUser) {
+    return res.status(404).json({ error: 'ユーザーが見つかりません' });
+  }
+  if (targetUser.role === 'admin' && adminCount <= 1) {
+    return res.status(400).json({ error: '最後の管理者は削除できません' });
+  }
+  db.prepare('UPDATE projects SET owner_id = ? WHERE owner_id = ?').run(req.user.id, id);
+  db.prepare('DELETE FROM users WHERE id = ?').run(id);
+  res.json({ success: true });
+});
+
 // Serve uploaded files
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // API Routes
 
-// Get all projects
+// Get all projects (filtered by owner, admin sees all)
 app.get('/api/projects', (req, res) => {
-  const projects = db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all();
+  const projects = req.user.role === 'admin'
+    ? db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all()
+    : db.prepare('SELECT * FROM projects WHERE owner_id = ? ORDER BY created_at DESC').all(req.user.id);
   res.json(projects);
 });
 
@@ -270,7 +481,7 @@ app.get('/api/projects', (req, res) => {
 app.post('/api/projects', (req, res) => {
   const id = uuidv4();
   const { name } = req.body;
-  db.prepare('INSERT INTO projects (id, name) VALUES (?, ?)').run(id, name || '新規プロジェクト');
+  db.prepare('INSERT INTO projects (id, name, owner_id) VALUES (?, ?, ?)').run(id, name || '新規プロジェクト', req.user.id);
 
   // Create upload directory for this project
   fs.mkdirSync(path.join(__dirname, 'uploads', id), { recursive: true });
@@ -476,13 +687,14 @@ app.post('/api/suumo/import/:customerId', async (req, res) => {
     const projectId = uuidv4();
     const projectName = details.name || customerData?.name || `SUUMO顧客 ${customerId}`;
     const createdAt = parseSuumoDate(details.inquiryDate);
+    const ownerId = req.user.id;
 
     if (createdAt) {
-      db.prepare('INSERT INTO projects (id, name, user_requirements, suumo_customer_id, created_at) VALUES (?, ?, ?, ?, ?)')
-        .run(projectId, projectName, details.requirements, customerId, createdAt);
+      db.prepare('INSERT INTO projects (id, name, user_requirements, suumo_customer_id, created_at, owner_id) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(projectId, projectName, details.requirements, customerId, createdAt, ownerId);
     } else {
-      db.prepare('INSERT INTO projects (id, name, user_requirements, suumo_customer_id) VALUES (?, ?, ?, ?)')
-        .run(projectId, projectName, details.requirements, customerId);
+      db.prepare('INSERT INTO projects (id, name, user_requirements, suumo_customer_id, owner_id) VALUES (?, ?, ?, ?, ?)')
+        .run(projectId, projectName, details.requirements, customerId, ownerId);
     }
 
     // Create upload directory for this project
@@ -516,52 +728,35 @@ app.post('/api/suumo/import/:customerId', async (req, res) => {
 });
 
 // Get project by ID
-app.get('/api/projects/:projectId', (req, res) => {
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
-  if (!project) {
-    return res.status(404).json({ error: 'Project not found' });
-  }
-
-  const houses = db.prepare('SELECT * FROM houses WHERE project_id = ?').all(req.params.projectId);
-  const recommendations = db.prepare('SELECT * FROM recommendations WHERE project_id = ?').all(req.params.projectId);
+app.get('/api/projects/:projectId', requireProjectAccess, (req, res) => {
+  const project = req.project;
+  const houses = db.prepare('SELECT * FROM houses WHERE project_id = ?').all(project.id);
+  const recommendations = db.prepare('SELECT * FROM recommendations WHERE project_id = ?').all(project.id);
 
   res.json({ ...project, houses, recommendations });
 });
 
 // Update project requirements
-app.put('/api/projects/:projectId/requirements', (req, res) => {
+app.put('/api/projects/:projectId/requirements', requireProjectAccess, (req, res) => {
   const { projectId } = req.params;
   const { requirements } = req.body;
-
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
-  if (!project) {
-    return res.status(404).json({ error: 'Project not found' });
-  }
 
   db.prepare('UPDATE projects SET user_requirements = ? WHERE id = ?').run(requirements, projectId);
 
   res.json({ success: true, requirements });
 });
 
-// Search properties using external API and save PDF
-app.post('/api/projects/:projectId/search-properties', async (req, res) => {
+// Search properties using external API and write REINS IDs to Notion
+app.post('/api/projects/:projectId/search-properties', requireProjectAccess, async (req, res) => {
   const { projectId } = req.params;
   const { userRequirements, typeId } = req.body;
-
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
-  if (!project) {
-    return res.status(404).json({ error: 'Project not found' });
-  }
-
-  if (!EXTERNAL_API_KEY) {
-    return res.status(500).json({ error: 'External API key not configured. Set EXTERNAL_API_KEY environment variable.' });
-  }
+  const project = req.project;
 
   try {
-    console.log(`[External API] Searching properties for project ${projectId}...`);
-    console.log(`[External API] Requirements: ${userRequirements?.substring(0, 100)}...`);
+    console.log(`[Search] Searching properties for project ${projectId} (${project.name})...`);
+    console.log(`[Search] Requirements: ${userRequirements?.substring(0, 100)}...`);
 
-    // Call external API to get PDF
+    // Call Fango API to get REINS IDs
     const response = await axios.post(
       `${EXTERNAL_API_URL}/api/external/search-pdf`,
       {
@@ -571,103 +766,110 @@ app.post('/api/projects/:projectId/search-properties', async (req, res) => {
       {
         headers: {
           'Content-Type': 'application/json',
-          'X-API-Key': EXTERNAL_API_KEY
+          'x-api-key': EXTERNAL_API_KEY
         },
-        responseType: 'arraybuffer',
-        timeout: 120000 // 2 minutes timeout
+        timeout: 600000 // 10 minutes timeout
       }
     );
 
-    // Save PDF to project directory
-    const uploadDir = path.join(__dirname, 'uploads', projectId);
-    fs.mkdirSync(uploadDir, { recursive: true });
+    // Fango returns: { success: true, reins_ids: [...], total_properties: N }
+    const { reins_ids } = response.data;
 
-    const pdfFilename = `search_result_${Date.now()}.pdf`;
-    const pdfPath = path.join(uploadDir, pdfFilename);
-    fs.writeFileSync(pdfPath, response.data);
-
-    console.log(`[External API] PDF saved: ${pdfFilename} (${response.data.length} bytes)`);
-
-    // Process the PDF (split pages, send to vector server, etc.)
-    const pdfBytes = response.data;
-    const pdfDoc = await PDFDocument.load(pdfBytes);
-    const pageCount = pdfDoc.getPageCount();
-
-    console.log(`[External API] Processing PDF: ${pageCount} pages`);
-
-    let processedPages = 0;
-    const houseIds = [];
-
-    // Try to send to vector server first
-    try {
-      const formData = new FormData();
-      formData.append('file', Buffer.from(pdfBytes), {
-        filename: pdfFilename,
-        contentType: 'application/pdf'
+    if (!reins_ids || reins_ids.length === 0) {
+      return res.json({
+        success: true,
+        message: '物件が見つかりませんでした',
+        count: 0,
+        reinsIds: []
       });
-      formData.append('metadata', JSON.stringify({ project_id: projectId }));
-      formData.append('build_immediately', 'true');
-      formData.append('user_id', projectId);
+    }
 
-      const vectorResponse = await axios.post(
-        `${VECTOR_SERVER}/api/v1/pdf/process`,
-        formData,
-        {
-          headers: {
-            ...formData.getHeaders(),
-            'ngrok-skip-browser-warning': 'true'
-          },
-          maxContentLength: Infinity,
-          maxBodyLength: Infinity,
-          timeout: 3000000
-        }
-      );
+    // Convert to properties format for downstream processing
+    const properties = reins_ids.map(id => ({ reins_id: id, platform: 'reins' }));
 
-      if (vectorResponse.data.page_ids) {
-        houseIds.push(...vectorResponse.data.page_ids);
-        console.log(`[External API] Vector server processed ${houseIds.length} pages`);
+    console.log(`[Search] Received ${properties.length} REINS IDs from Fango`);
+
+    // Write each REINS ID to Notion with user info
+    const reinsIds = [];
+    const notionResults = [];
+
+    for (const prop of properties) {
+      const { reins_id, platform } = prop;
+
+      if (!reins_id) continue;
+
+      reinsIds.push(reins_id);
+
+      // Sync to Notion
+      const recInfo = {
+        reins_id: reins_id,
+        project_id: projectId,
+        user_name: project.name || 'Unknown',
+        platform: platform || 'unknown',
+        round: 0  // Initial search, round 0
+      };
+
+      try {
+        const result = await syncRecommendationToNotion(recInfo);
+        notionResults.push({ reins_id, ...result });
+        console.log(`[Search] Synced to Notion: ${reins_id} (${result.action})`);
+      } catch (notionErr) {
+        console.error(`[Search] Notion sync error for ${reins_id}:`, notionErr.message);
+        notionResults.push({ reins_id, success: false, error: notionErr.message });
       }
-    } catch (vectorErr) {
-      console.error('[External API] Vector server error:', vectorErr.message);
+
+      // Small delay to avoid rate limiting
+      await new Promise(r => setTimeout(r, 200));
     }
 
-    // Split PDF and save each page
-    for (let i = 0; i < pageCount; i++) {
-      const houseId = houseIds[i] || uuidv4();
-      const pageFilename = `page_${i + 1}_${pdfFilename}`;
-
-      const newPdfDoc = await PDFDocument.create();
-      const [copiedPage] = await newPdfDoc.copyPages(pdfDoc, [i]);
-      newPdfDoc.addPage(copiedPage);
-
-      const pagePath = path.join(uploadDir, pageFilename);
-      const newPdfBytes = await newPdfDoc.save();
-      fs.writeFileSync(pagePath, newPdfBytes);
-
-      // Save to database
-      db.prepare('INSERT INTO houses (id, project_id, filename, content) VALUES (?, ?, ?, ?)')
-        .run(houseId, projectId, pageFilename, `外部API検索結果 - ページ${i + 1}`);
-
-      processedPages++;
-    }
-
-    // Delete the original combined PDF
-    fs.unlinkSync(pdfPath);
-
-    console.log(`[External API] Processed ${processedPages} pages for project ${projectId}`);
+    const successCount = notionResults.filter(r => r.success).length;
+    console.log(`[Search] Synced ${successCount}/${reinsIds.length} properties to Notion`);
 
     res.json({
       success: true,
-      message: `${processedPages}件の物件を取得しました`,
-      processedPages,
-      houseIds: houseIds.length > 0 ? houseIds : undefined
+      message: `${reinsIds.length}件の物件を取得し、${successCount}件をNotionに同期しました`,
+      count: reinsIds.length,
+      reinsIds,
+      notionSyncResults: notionResults
     });
 
   } catch (error) {
-    console.error('[External API] Error:', error.message);
-    if (error.response) {
-      console.error('[External API] Response status:', error.response.status);
+    console.error('[Search] Error:', error.message);
+
+    // Connection refused / API not running
+    if (error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET' || error.code === 'ENOTFOUND') {
+      console.error(`[Search] External API unreachable at ${EXTERNAL_API_URL}`);
+      return res.status(503).json({
+        error: '物件検索APIに接続できません',
+        details: `外部API (${EXTERNAL_API_URL}) が起動していない可能性があります。`,
+        code: error.code
+      });
     }
+
+    if (error.response) {
+      console.error('[Search] Response status:', error.response.status);
+
+      // 404 with search result body = no matching properties
+      if (error.response.status === 404 && error.response.data?.parsed_requirements) {
+        return res.json({
+          success: true,
+          message: '条件に合う物件が見つかりませんでした。条件を変更してお試しください。',
+          count: 0,
+          reinsIds: [],
+          parsedRequirements: error.response.data.parsed_requirements
+        });
+      }
+
+      // 404 without search body = endpoint not found (API misconfiguration)
+      if (error.response.status === 404) {
+        console.error(`[Search] Endpoint not found: ${EXTERNAL_API_URL}/api/external/search-pdf`);
+        return res.status(502).json({
+          error: '物件検索APIのエンドポイントが見つかりません',
+          details: `${EXTERNAL_API_URL}/api/external/search-pdf が存在しません。APIのバージョンや設定を確認してください。`
+        });
+      }
+    }
+
     res.status(500).json({
       error: 'Failed to search properties',
       details: error.message
@@ -678,6 +880,12 @@ app.post('/api/projects/:projectId/search-properties', async (req, res) => {
 // Upload files to project - sends PDF to vector server and uses returned page_ids
 app.post('/api/projects/:projectId/upload', upload.array('files'), async (req, res) => {
   const { projectId } = req.params;
+  // Check project access
+  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
+  if (!project) return res.status(404).json({ error: 'Project not found' });
+  if (req.user.role !== 'admin' && project.owner_id !== req.user.id) {
+    return res.status(403).json({ error: 'アクセス権限がありません' });
+  }
   const files = req.files;
   const { requirements } = req.body;
 
@@ -838,7 +1046,7 @@ app.post('/api/projects/:projectId/upload', upload.array('files'), async (req, r
 });
 
 // Get random sample for initial round
-app.post('/api/projects/:projectId/random-sample', (req, res) => {
+app.post('/api/projects/:projectId/random-sample', requireProjectAccess, (req, res) => {
   const { projectId } = req.params;
 
   // Get all houses not yet recommended in any round
@@ -864,20 +1072,61 @@ app.post('/api/projects/:projectId/random-sample', (req, res) => {
 });
 
 // Submit ratings and get recommendations
-app.post('/api/projects/:projectId/rate', async (req, res) => {
+app.post('/api/projects/:projectId/rate', requireProjectAccess, async (req, res) => {
   const { projectId } = req.params;
   const { ratings, round } = req.body; // ratings: [{houseId, rating, notes}]
+  const project = req.project;
 
-  // Save ratings
+  // Save ratings and sync to Notion
+  const notionResults = [];
   for (const r of ratings) {
     db.prepare('UPDATE recommendations SET rating = ?, notes = ? WHERE project_id = ? AND house_id = ? AND round = ?')
       .run(r.rating, r.notes || '', projectId, r.houseId, round);
+
+    // Get house info for Notion sync
+    const house = db.prepare('SELECT * FROM houses WHERE id = ?').get(r.houseId);
+
+    // Sync to Notion if house has reins_id
+    if (house?.reins_id) {
+      // Parse content for property details
+      const contentLines = (house.content || '').split('\n');
+      const getField = (prefix) => {
+        const line = contentLines.find(l => l.startsWith(prefix));
+        return line ? line.replace(prefix, '').trim() : '';
+      };
+
+      const recInfo = {
+        reins_id: house.reins_id,
+        project_id: projectId,
+        user_name: project?.name || 'Unknown',
+        platform: house.platform || 'unknown',
+        round: round,
+        rating: r.rating,
+        location: getField('所在地:'),
+        rent: getField('賃料:'),
+        layout: getField('間取り:')
+      };
+
+      try {
+        const result = await syncRecommendationToNotion(recInfo);
+        notionResults.push(result);
+        console.log(`[Rate] Synced to Notion: ${house.reins_id} (${r.rating})`);
+      } catch (err) {
+        console.error(`[Rate] Notion sync error for ${house.reins_id}:`, err.message);
+      }
+    }
   }
 
   // Update project round
   db.prepare('UPDATE projects SET current_round = ? WHERE id = ?').run(round + 1, projectId);
 
-  res.json({ success: true });
+  res.json({
+    success: true,
+    notionSync: {
+      total: notionResults.length,
+      success: notionResults.filter(r => r.success).length
+    }
+  });
 });
 
 // GPT Agent: Analyze user profile based on feedback
@@ -1078,13 +1327,9 @@ id1,id2,id3,...`
 }
 
 // Get next round recommendations
-app.post('/api/projects/:projectId/next-round', async (req, res) => {
+app.post('/api/projects/:projectId/next-round', requireProjectAccess, async (req, res) => {
   const { projectId } = req.params;
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
-
-  if (!project) {
-    return res.status(404).json({ error: 'Project not found' });
-  }
+  const project = req.project;
 
   const nextRound = project.current_round;
 
@@ -1112,7 +1357,7 @@ app.post('/api/projects/:projectId/next-round', async (req, res) => {
 });
 
 // Get recommendations for a specific round
-app.get('/api/projects/:projectId/rounds/:round', (req, res) => {
+app.get('/api/projects/:projectId/rounds/:round', requireProjectAccess, (req, res) => {
   const { projectId, round } = req.params;
 
   const recommendations = db.prepare(`
@@ -1126,7 +1371,7 @@ app.get('/api/projects/:projectId/rounds/:round', (req, res) => {
 });
 
 // Download all PDFs as zip
-app.get('/api/projects/:projectId/download/:round', (req, res) => {
+app.get('/api/projects/:projectId/download/:round', requireProjectAccess, (req, res) => {
   const { projectId, round } = req.params;
 
   const recommendations = db.prepare(`
@@ -1153,7 +1398,7 @@ app.get('/api/projects/:projectId/download/:round', (req, res) => {
 });
 
 // Delete project
-app.delete('/api/projects/:projectId', async (req, res) => {
+app.delete('/api/projects/:projectId', requireProjectAccess, async (req, res) => {
   const { projectId } = req.params;
 
   // Note: Vector server doesn't have delete API yet
@@ -1171,6 +1416,366 @@ app.delete('/api/projects/:projectId', async (req, res) => {
   }
 
   res.json({ success: true });
+});
+
+// ============ LINE Webhook and Management APIs ============
+
+// LINE Webhook endpoint (receives events from LINE)
+// IMPORTANT: This must use raw body for signature verification
+app.post('/api/line/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!LINE_ENABLED) {
+    return res.status(503).json({ error: 'LINE integration not configured' });
+  }
+
+  // Verify signature
+  const signature = req.headers['x-line-signature'];
+  if (!signature) {
+    console.log('[LINE] Missing signature');
+    return res.status(400).json({ error: 'Missing signature' });
+  }
+
+  // Use raw buffer for signature verification
+  const bodyBuffer = req.body;
+  if (!lineHandler.verifySignature(bodyBuffer, signature)) {
+    console.log('[LINE] Invalid signature');
+    return res.status(401).json({ error: 'Invalid signature' });
+  }
+
+  // Parse events
+  let events;
+  try {
+    events = JSON.parse(bodyBuffer.toString()).events;
+  } catch (e) {
+    console.error('[LINE] Failed to parse body:', e.message);
+    return res.status(400).json({ error: 'Invalid body' });
+  }
+
+  // Respond quickly (LINE expects response within seconds)
+  res.status(200).end();
+
+  // Process events asynchronously
+  for (const event of events) {
+    await processLineEvent(event);
+  }
+});
+
+// Process LINE event
+async function processLineEvent(event) {
+  console.log('[LINE] Event received:', event.type);
+
+  // Handle follow event (user adds friend)
+  if (event.type === 'follow') {
+    await handleLineFollowEvent(event);
+    return;
+  }
+
+  // Only process message events
+  if (event.type !== 'message') {
+    console.log('[LINE] Ignoring non-message event');
+    return;
+  }
+
+  const userId = event.source.userId;
+  const replyToken = event.replyToken;
+  const messageType = event.message.type;
+
+  // Handle file messages (chat record txt files)
+  if (messageType === 'file') {
+    await handleLineChatRecordFile(event, userId, replyToken);
+    return;
+  }
+
+  // Handle text messages - check if it looks like pasted chat record
+  if (messageType === 'text') {
+    const messageText = event.message.text;
+
+    // Check if text looks like a pasted chat record (contains date/time patterns)
+    const isChatRecord = messageText.includes('\n') &&
+      (messageText.match(/\d{4}\/\d{1,2}\/\d{1,2}/) ||
+       messageText.match(/\d{1,2}:\d{2}\t/));
+
+    if (isChatRecord) {
+      await handleLineChatRecordText(messageText, userId, replyToken);
+      return;
+    }
+
+    // Otherwise handle as regular message
+    await handleLineRegularMessage(messageText, userId, replyToken);
+    return;
+  }
+
+  console.log(`[LINE] Ignoring unsupported message type: ${messageType}`);
+}
+
+// Handle chat record txt file upload
+async function handleLineChatRecordFile(event, userId, replyToken) {
+  const messageId = event.message.id;
+  const fileName = event.message.fileName || 'unknown.txt';
+
+  console.log(`[LINE] Received file: ${fileName} from ${userId}`);
+
+  // Check if it's a txt file
+  if (!fileName.toLowerCase().endsWith('.txt')) {
+    await lineHandler.replyMessage(replyToken,
+      lineHandler.textMessage('申し訳ございません。現在、.txt形式のファイルのみ対応しております。')
+    );
+    return;
+  }
+
+  // Download file content
+  const fileContent = await lineHandler.getMessageContent(messageId);
+  if (!fileContent) {
+    await lineHandler.replyMessage(replyToken,
+      lineHandler.textMessage('ファイルの取得に失敗しました。もう一度お試しください。')
+    );
+    return;
+  }
+
+  // Decode content as UTF-8
+  const chatText = fileContent.toString('utf-8');
+  console.log(`[LINE] File content length: ${chatText.length} chars`);
+
+  await processChatRecord(chatText, userId, replyToken, fileName);
+}
+
+// Handle pasted chat record text
+async function handleLineChatRecordText(chatText, userId, replyToken) {
+  console.log(`[LINE] Processing pasted chat record from ${userId}`);
+  await processChatRecord(chatText, userId, replyToken, 'pasted_chat');
+}
+
+// Process chat record (from file or pasted text)
+async function processChatRecord(chatText, userId, replyToken, source) {
+  // Parse the chat record
+  const parsedMessages = lineHandler.parseChatExportTxt(chatText);
+  console.log(`[LINE] Parsed ${parsedMessages.length} messages from chat record`);
+
+  // Format for analysis
+  let formattedChat = chatText;
+  if (parsedMessages.length > 0) {
+    formattedChat = parsedMessages.map(m =>
+      `[${m.date} ${m.time}] ${m.sender}: ${m.content}`
+    ).join('\n');
+  }
+
+  // Extract customer name from chat if possible
+  let customerName = '顧客';
+  if (parsedMessages.length > 0) {
+    // Find the most common sender that's not likely the agent
+    const senderCounts = {};
+    parsedMessages.forEach(m => {
+      senderCounts[m.sender] = (senderCounts[m.sender] || 0) + 1;
+    });
+    const senders = Object.keys(senderCounts);
+    if (senders.length > 0) {
+      customerName = senders[0]; // First sender is likely the customer
+    }
+  }
+
+  // Analyze chat record with GPT
+  let requirements = null;
+  if (openai) {
+    await lineHandler.replyMessage(replyToken,
+      lineHandler.textMessage(`📝 チャット履歴を受け取りました。\n分析中です...お待ちください。`)
+    );
+
+    requirements = await lineHandler.analyzeChatRecord(formattedChat, openai);
+    console.log(`[LINE] Chat analysis completed`);
+  } else {
+    requirements = `【チャット履歴】\n${chatText.substring(0, 2000)}${chatText.length > 2000 ? '...(省略)' : ''}`;
+  }
+
+  // Create new project
+  const projectId = uuidv4();
+  const projectName = `${customerName} (${new Date().toLocaleDateString('ja-JP')})`;
+
+  db.prepare(`
+    INSERT INTO projects (id, name, line_user_id, source, user_requirements, owner_id)
+    VALUES (?, ?, ?, 'line_chat_import', ?, ?)
+  `).run(projectId, projectName, userId, requirements || chatText, getAdminUserId());
+
+  // Create upload directory
+  fs.mkdirSync(path.join(__dirname, 'uploads', projectId), { recursive: true });
+
+  // Save the original chat record as a conversation entry
+  db.prepare(`
+    INSERT INTO line_conversations (id, project_id, line_user_id, message_type, message_content, sender)
+    VALUES (?, ?, ?, 'chat_record', ?, 'import')
+  `).run(uuidv4(), projectId, userId, chatText);
+
+  console.log(`[LINE] Created project ${projectId} from chat record`);
+
+  // Send confirmation with extracted requirements
+  const confirmMessage = requirements
+    ? `✅ チャット履歴の分析が完了しました！\n\nプロジェクト「${projectName}」を作成しました。\n\n${requirements.substring(0, 800)}${requirements.length > 800 ? '\n...(続く)' : ''}`
+    : `✅ チャット履歴を保存しました。\n\nプロジェクト「${projectName}」を作成しました。`;
+
+  await lineHandler.pushMessage(userId, lineHandler.textMessage(confirmMessage));
+}
+
+// Handle regular text message (not chat record)
+async function handleLineRegularMessage(messageText, userId, replyToken) {
+  console.log(`[LINE] Regular message from ${userId}: ${messageText.substring(0, 50)}...`);
+
+  // Find existing project for this user
+  let project = db.prepare(`
+    SELECT * FROM projects
+    WHERE line_user_id = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(userId);
+
+  if (!project) {
+    // Create new project for this user
+    const profile = await lineHandler.getUserProfile(userId);
+    const userName = profile?.displayName || `LINE顧客 ${userId.substring(0, 8)}`;
+
+    const projectId = uuidv4();
+    db.prepare(`
+      INSERT INTO projects (id, name, line_user_id, source, user_requirements, owner_id)
+      VALUES (?, ?, ?, 'line', ?, ?)
+    `).run(projectId, userName, userId, `【LINE会話開始】\n${messageText}`, getAdminUserId());
+
+    project = { id: projectId, name: userName };
+
+    // Create upload directory
+    fs.mkdirSync(path.join(__dirname, 'uploads', projectId), { recursive: true });
+    console.log(`[LINE] Created new project ${projectId} for ${userName}`);
+
+    // Save first message
+    db.prepare(`
+      INSERT INTO line_conversations (id, project_id, line_user_id, message_type, message_content, sender)
+      VALUES (?, ?, ?, 'text', ?, 'user')
+    `).run(uuidv4(), projectId, userId, messageText);
+
+    // Send welcome message
+    await lineHandler.replyMessage(replyToken, lineHandler.getWelcomeMessage(profile?.displayName));
+  } else {
+    // Save conversation
+    const convId = uuidv4();
+    db.prepare(`
+      INSERT INTO line_conversations (id, project_id, line_user_id, message_type, message_content, sender)
+      VALUES (?, ?, ?, 'text', ?, 'user')
+    `).run(convId, project.id, userId, messageText);
+
+    // Update requirements with new message
+    const currentReqs = project.user_requirements || '';
+    const updatedReqs = currentReqs + '\n' + messageText;
+    db.prepare('UPDATE projects SET user_requirements = ? WHERE id = ?')
+      .run(updatedReqs, project.id);
+
+    // Check message count for auto-analysis
+    const messageCount = db.prepare(`
+      SELECT COUNT(*) as count FROM line_conversations
+      WHERE project_id = ? AND sender = 'user'
+    `).get(project.id).count;
+
+    const threshold = parseInt(process.env.LINE_MESSAGE_ANALYZE_THRESHOLD || '3');
+
+    if (messageCount >= threshold && openai) {
+      // Analyze conversation and extract structured requirements
+      const messages = db.prepare(`
+        SELECT * FROM line_conversations
+        WHERE project_id = ? ORDER BY timestamp ASC
+      `).all(project.id);
+
+      console.log(`[LINE] Analyzing ${messages.length} messages for project ${project.id}`);
+      const requirements = await lineHandler.parseRequirementsFromMessages(messages, openai);
+
+      if (requirements) {
+        db.prepare('UPDATE projects SET user_requirements = ? WHERE id = ?')
+          .run(requirements, project.id);
+
+        await lineHandler.replyMessage(replyToken, lineHandler.getRequirementsAnalyzedMessage());
+        console.log(`[LINE] Requirements extracted for project ${project.id}`);
+      } else {
+        await lineHandler.replyMessage(replyToken, lineHandler.getAcknowledgmentMessage());
+      }
+    } else {
+      // Send acknowledgment
+      await lineHandler.replyMessage(replyToken, lineHandler.getAcknowledgmentMessage());
+    }
+  }
+}
+
+// Handle LINE follow event (user adds friend)
+async function handleLineFollowEvent(event) {
+  const userId = event.source.userId;
+  const profile = await lineHandler.getUserProfile(userId);
+
+  console.log(`[LINE] New follower: ${profile?.displayName || userId}`);
+
+  await lineHandler.replyMessage(event.replyToken, lineHandler.getWelcomeMessage(profile?.displayName));
+}
+
+// Get LINE integration status
+app.get('/api/line/status', (req, res) => {
+  const totalProjects = db.prepare("SELECT COUNT(*) as count FROM projects WHERE source = 'line'").get().count;
+  const totalConversations = db.prepare('SELECT COUNT(*) as count FROM line_conversations').get().count;
+
+  res.json({
+    enabled: LINE_ENABLED,
+    totalProjects,
+    totalConversations
+  });
+});
+
+// Get LINE projects
+app.get('/api/line/projects', (req, res) => {
+  const projects = req.user.role === 'admin'
+    ? db.prepare(`
+        SELECT p.*, COUNT(c.id) as message_count
+        FROM projects p
+        LEFT JOIN line_conversations c ON p.id = c.project_id
+        WHERE p.source = 'line'
+        GROUP BY p.id
+        ORDER BY p.created_at DESC
+      `).all()
+    : db.prepare(`
+        SELECT p.*, COUNT(c.id) as message_count
+        FROM projects p
+        LEFT JOIN line_conversations c ON p.id = c.project_id
+        WHERE p.source = 'line' AND p.owner_id = ?
+        GROUP BY p.id
+        ORDER BY p.created_at DESC
+      `).all(req.user.id);
+  res.json(projects);
+});
+
+// Get LINE conversations for a project
+app.get('/api/line/projects/:projectId/conversations', requireProjectAccess, (req, res) => {
+  const conversations = db.prepare(`
+    SELECT * FROM line_conversations
+    WHERE project_id = ?
+    ORDER BY timestamp ASC
+  `).all(req.params.projectId);
+  res.json(conversations);
+});
+
+// Send message to LINE user
+app.post('/api/line/projects/:projectId/send', requireProjectAccess, async (req, res) => {
+  if (!LINE_ENABLED) {
+    return res.status(503).json({ error: 'LINE integration not configured' });
+  }
+
+  const { message } = req.body;
+  const project = req.project;
+
+  if (!project.line_user_id) {
+    return res.status(400).json({ error: 'Not a LINE project' });
+  }
+
+  const success = await lineHandler.pushMessage(project.line_user_id, message);
+
+  if (success) {
+    // Save sent message
+    db.prepare(`
+      INSERT INTO line_conversations (id, project_id, line_user_id, message_type, message_content, sender)
+      VALUES (?, ?, ?, 'text', ?, 'bot')
+    `).run(uuidv4(), project.id, project.line_user_id, message);
+  }
+
+  res.json({ success });
 });
 
 app.listen(PORT, () => {

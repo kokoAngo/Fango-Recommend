@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import axios from 'axios'
+import api, { getCurrentUser } from '../api'
 
 interface Project {
   id: string
@@ -19,6 +19,15 @@ interface SuumoCustomer {
   hasDetailPage: boolean
 }
 
+interface User {
+  id: string
+  username: string
+  display_name: string
+  role: string
+  created_at: string
+  projectCount?: number
+}
+
 function HomePage() {
   const [projects, setProjects] = useState<Project[]>([])
   const [files, setFiles] = useState<File[]>([])
@@ -30,19 +39,62 @@ function HomePage() {
   const folderInputRef = useRef<HTMLInputElement>(null)
   const navigate = useNavigate()
 
+  // Current user
+  const currentUser = getCurrentUser()
+  const isAdmin = currentUser?.role === 'admin'
+
   // SUUMO integration state
   const [suumoCustomers, setSuumoCustomers] = useState<SuumoCustomer[]>([])
   const [showSuumoModal, setShowSuumoModal] = useState(false)
   const [suumoLoading, setSuumoLoading] = useState(false)
   const [importingCustomerId, setImportingCustomerId] = useState<string | null>(null)
 
+  // Auto-sync state
+  const [autoSyncEnabled, setAutoSyncEnabled] = useState(false)
+  const [autoSyncLoading, setAutoSyncLoading] = useState(false)
+
+  // Multi-select state
+  const [selectedProjects, setSelectedProjects] = useState<Set<string>>(new Set())
+  const [deletingMultiple, setDeletingMultiple] = useState(false)
+
+  // User management state (admin only)
+  const [showUserModal, setShowUserModal] = useState(false)
+  const [users, setUsers] = useState<User[]>([])
+  const [newUsername, setNewUsername] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [newDisplayName, setNewDisplayName] = useState('')
+  const [newRole, setNewRole] = useState('user')
+  const [userLoading, setUserLoading] = useState(false)
+
   useEffect(() => {
     fetchProjects()
+    fetchAutoSyncStatus()
   }, [])
+
+  const fetchAutoSyncStatus = async () => {
+    try {
+      const res = await api.get('/api/suumo/status')
+      setAutoSyncEnabled(res.data.autoSyncEnabled)
+    } catch (err) {
+      console.error('Failed to fetch auto-sync status:', err)
+    }
+  }
+
+  const toggleAutoSync = async () => {
+    setAutoSyncLoading(true)
+    try {
+      const res = await api.post('/api/suumo/auto-sync', { enabled: !autoSyncEnabled })
+      setAutoSyncEnabled(res.data.autoSyncEnabled)
+    } catch (err) {
+      console.error('Failed to toggle auto-sync:', err)
+    } finally {
+      setAutoSyncLoading(false)
+    }
+  }
 
   const fetchProjects = async () => {
     try {
-      const res = await axios.get('/api/projects')
+      const res = await api.get('/api/projects')
       setProjects(res.data)
     } catch (err) {
       console.error('Failed to fetch projects:', err)
@@ -81,16 +133,16 @@ function HomePage() {
   }
 
   const startNewProject = async () => {
-    const pdfFiles = files.filter(f => f.name.endsWith('.pdf'))
-    if (pdfFiles.length === 0) {
-      alert('PDFファイルをアップロードしてください')
+    // Allow project creation with PDF, TXT files, or text input
+    if (files.length === 0 && !requirements.trim()) {
+      alert('ファイルをアップロードするか、要望・条件を入力してください')
       return
     }
 
     setLoading(true)
     try {
       // Create project
-      const projectRes = await axios.post('/api/projects', {
+      const projectRes = await api.post('/api/projects', {
         name: projectName || `プロジェクト ${new Date().toLocaleDateString('ja-JP')}`
       })
       const projectId = projectRes.data.id
@@ -100,7 +152,7 @@ function HomePage() {
       files.forEach(file => formData.append('files', file))
       formData.append('requirements', requirements)
 
-      await axios.post(`/api/projects/${projectId}/upload`, formData, {
+      await api.post(`/api/projects/${projectId}/upload`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
       })
 
@@ -138,11 +190,62 @@ function HomePage() {
       return
     }
     try {
-      await axios.delete(`/api/projects/${projectId}`)
+      await api.delete(`/api/projects/${projectId}`)
       setProjects(projects.filter(p => p.id !== projectId))
+      setSelectedProjects(prev => {
+        const newSet = new Set(prev)
+        newSet.delete(projectId)
+        return newSet
+      })
     } catch (err) {
       console.error('Failed to delete project:', err)
       alert('プロジェクトの削除に失敗しました')
+    }
+  }
+
+  // Multi-select functions
+  const toggleSelectProject = (e: React.MouseEvent, projectId: string) => {
+    e.stopPropagation()
+    setSelectedProjects(prev => {
+      const newSet = new Set(prev)
+      if (newSet.has(projectId)) {
+        newSet.delete(projectId)
+      } else {
+        newSet.add(projectId)
+      }
+      return newSet
+    })
+  }
+
+  const toggleSelectAll = () => {
+    if (selectedProjects.size === projects.length) {
+      setSelectedProjects(new Set())
+    } else {
+      setSelectedProjects(new Set(projects.map(p => p.id)))
+    }
+  }
+
+  const deleteSelectedProjects = async () => {
+    if (selectedProjects.size === 0) return
+
+    if (!confirm(`選択した${selectedProjects.size}件のプロジェクトを削除しますか？\nこの操作は取り消せません。`)) {
+      return
+    }
+
+    setDeletingMultiple(true)
+    try {
+      const deletePromises = Array.from(selectedProjects).map(id =>
+        api.delete(`/api/projects/${id}`)
+      )
+      await Promise.all(deletePromises)
+      setProjects(projects.filter(p => !selectedProjects.has(p.id)))
+      setSelectedProjects(new Set())
+    } catch (err) {
+      console.error('Failed to delete projects:', err)
+      alert('一部のプロジェクトの削除に失敗しました')
+      fetchProjects() // Refresh to get current state
+    } finally {
+      setDeletingMultiple(false)
     }
   }
 
@@ -150,7 +253,7 @@ function HomePage() {
   const fetchSuumoCustomers = async () => {
     setSuumoLoading(true)
     try {
-      const res = await axios.get('/api/suumo/customers')
+      const res = await api.get('/api/suumo/customers')
       setSuumoCustomers(res.data.customers || [])
       setShowSuumoModal(true)
     } catch (err) {
@@ -165,7 +268,7 @@ function HomePage() {
   const importSuumoCustomer = async (customer: SuumoCustomer) => {
     setImportingCustomerId(customer.id)
     try {
-      const res = await axios.post(`/api/suumo/import/${customer.id}`, {
+      const res = await api.post(`/api/suumo/import/${customer.id}`, {
         customerData: customer
       })
       setShowSuumoModal(false)
@@ -178,11 +281,117 @@ function HomePage() {
     }
   }
 
+  // User management functions (admin only)
+  const fetchUsers = async () => {
+    try {
+      const res = await api.get('/api/users')
+      setUsers(res.data)
+    } catch (err) {
+      console.error('Failed to fetch users:', err)
+    }
+  }
+
+  const openUserModal = () => {
+    fetchUsers()
+    setShowUserModal(true)
+  }
+
+  const createUser = async () => {
+    if (!newUsername || !newPassword) {
+      alert('ユーザー名とパスワードは必須です')
+      return
+    }
+    setUserLoading(true)
+    try {
+      await api.post('/api/users', {
+        username: newUsername,
+        password: newPassword,
+        displayName: newDisplayName || newUsername,
+        role: newRole
+      })
+      setNewUsername('')
+      setNewPassword('')
+      setNewDisplayName('')
+      setNewRole('user')
+      fetchUsers()
+    } catch (err: any) {
+      alert(err.response?.data?.error || 'ユーザーの作成に失敗しました')
+    } finally {
+      setUserLoading(false)
+    }
+  }
+
+  const deleteUser = async (userId: string, username: string) => {
+    if (!confirm(`「${username}」を削除しますか？\nこのユーザーのプロジェクトはあなたに移管されます。`)) return
+    try {
+      await api.delete(`/api/users/${userId}`)
+      fetchUsers()
+      fetchProjects()
+    } catch (err: any) {
+      alert(err.response?.data?.error || 'ユーザーの削除に失敗しました')
+    }
+  }
+
+  const handleLogout = () => {
+    localStorage.removeItem('token')
+    localStorage.removeItem('user')
+    window.location.href = '/login'
+  }
+
   return (
     <>
-      <header className="header">
+      <header className="header" style={{ position: 'relative' }}>
         <h1>Fango Recommend</h1>
         <p>AI駆動の物件推薦システム</p>
+        <div style={{
+          position: 'absolute',
+          top: '16px',
+          right: '20px',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '10px'
+        }}>
+          <span style={{ color: 'rgba(255,255,255,0.8)', fontSize: '0.85rem' }}>
+            {currentUser?.displayName || currentUser?.username}
+            {isAdmin && <span style={{
+              marginLeft: '6px',
+              padding: '2px 8px',
+              background: 'rgba(255,255,255,0.2)',
+              borderRadius: '10px',
+              fontSize: '0.75rem'
+            }}>管理者</span>}
+          </span>
+          {isAdmin && (
+            <button
+              onClick={openUserModal}
+              style={{
+                padding: '6px 12px',
+                background: 'rgba(255,255,255,0.2)',
+                color: 'white',
+                border: '1px solid rgba(255,255,255,0.3)',
+                borderRadius: '6px',
+                cursor: 'pointer',
+                fontSize: '0.8rem'
+              }}
+            >
+              ユーザー管理
+            </button>
+          )}
+          <button
+            onClick={handleLogout}
+            style={{
+              padding: '6px 12px',
+              background: 'rgba(255,255,255,0.2)',
+              color: 'white',
+              border: '1px solid rgba(255,255,255,0.3)',
+              borderRadius: '6px',
+              cursor: 'pointer',
+              fontSize: '0.8rem'
+            }}
+          >
+            ログアウト
+          </button>
+        </div>
       </header>
 
       <div className="home-grid">
@@ -190,14 +399,26 @@ function HomePage() {
         <div className="card">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
             <h2 style={{ margin: 0 }}>新規プロジェクト</h2>
-            <button
-              className="btn btn-secondary"
-              onClick={fetchSuumoCustomers}
-              disabled={suumoLoading}
-              style={{ fontSize: '0.85rem' }}
-            >
-              {suumoLoading ? '取得中...' : '📥 SUUMOから取得'}
-            </button>
+            <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', fontSize: '0.85rem' }}>
+                <input
+                  type="checkbox"
+                  checked={autoSyncEnabled}
+                  onChange={toggleAutoSync}
+                  disabled={autoSyncLoading}
+                  style={{ width: '16px', height: '16px', cursor: 'pointer' }}
+                />
+                自動同期
+              </label>
+              <button
+                className="btn btn-secondary"
+                onClick={fetchSuumoCustomers}
+                disabled={suumoLoading}
+                style={{ fontSize: '0.85rem' }}
+              >
+                {suumoLoading ? '取得中...' : '📥 SUUMOから取得'}
+              </button>
+            </div>
           </div>
 
           <div className="form-group" style={{ marginBottom: '20px' }}>
@@ -312,7 +533,7 @@ function HomePage() {
             className="btn btn-primary"
             style={{ width: '100%', marginTop: '20px' }}
             onClick={startNewProject}
-            disabled={loading || files.length === 0}
+            disabled={loading || (files.length === 0 && !requirements.trim())}
           >
             {loading ? '作成中...' : '新規プロジェクトを開始'}
           </button>
@@ -320,7 +541,40 @@ function HomePage() {
 
         {/* Existing Projects Section */}
         <div className="card">
-          <h2>マイプロジェクト</h2>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
+            <h2 style={{ margin: 0 }}>マイプロジェクト</h2>
+            {projects.length > 0 && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', fontSize: '0.85rem' }}>
+                  <input
+                    type="checkbox"
+                    checked={selectedProjects.size === projects.length && projects.length > 0}
+                    onChange={toggleSelectAll}
+                    style={{ width: '16px', height: '16px', cursor: 'pointer' }}
+                  />
+                  全選択
+                </label>
+                {selectedProjects.size > 0 && (
+                  <button
+                    onClick={deleteSelectedProjects}
+                    disabled={deletingMultiple}
+                    style={{
+                      padding: '6px 12px',
+                      background: '#dc2626',
+                      border: 'none',
+                      borderRadius: '6px',
+                      color: 'white',
+                      cursor: deletingMultiple ? 'not-allowed' : 'pointer',
+                      fontSize: '0.85rem',
+                      opacity: deletingMultiple ? 0.6 : 1
+                    }}
+                  >
+                    {deletingMultiple ? '削除中...' : `🗑️ ${selectedProjects.size}件削除`}
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
 
           {projects.length === 0 ? (
             <div className="empty-state">
@@ -330,48 +584,62 @@ function HomePage() {
               </p>
             </div>
           ) : (
-            <ul className="project-list">
-              {projects.map((project) => (
-                <li
-                  key={project.id}
-                  className="project-item"
-                  onClick={() => navigate(`/project/${project.id}`)}
-                >
-                  <div>
-                    <div className="project-name">{project.name}</div>
-                    <div className="project-date">
-                      {formatDate(project.created_at)}
+            <div style={{ maxHeight: '500px', overflowY: 'auto' }}>
+              <ul className="project-list" style={{ margin: 0 }}>
+                {projects.map((project) => (
+                  <li
+                    key={project.id}
+                    className="project-item"
+                    onClick={() => navigate(`/project/${project.id}`)}
+                    style={{
+                      background: selectedProjects.has(project.id) ? '#f0f3ff' : undefined
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                      <input
+                        type="checkbox"
+                        checked={selectedProjects.has(project.id)}
+                        onClick={(e) => toggleSelectProject(e, project.id)}
+                        onChange={() => {}}
+                        style={{ width: '18px', height: '18px', cursor: 'pointer', flexShrink: 0 }}
+                      />
+                      <div>
+                        <div className="project-name">{project.name}</div>
+                        <div className="project-date">
+                          {formatDate(project.created_at)}
+                        </div>
+                      </div>
                     </div>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                    <div style={{
-                      padding: '4px 12px',
-                      background: '#f0f3ff',
-                      borderRadius: '20px',
-                      fontSize: '0.85rem',
-                      color: '#667eea'
-                    }}>
-                      {getRoundLabel(project.current_round)}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                      <div style={{
+                        padding: '4px 12px',
+                        background: selectedProjects.has(project.id) ? '#e0e5ff' : '#f0f3ff',
+                        borderRadius: '20px',
+                        fontSize: '0.85rem',
+                        color: '#667eea'
+                      }}>
+                        {getRoundLabel(project.current_round)}
+                      </div>
+                      <button
+                        onClick={(e) => deleteProject(e, project.id, project.name)}
+                        style={{
+                          padding: '6px 10px',
+                          background: '#fee2e2',
+                          border: 'none',
+                          borderRadius: '6px',
+                          color: '#dc2626',
+                          cursor: 'pointer',
+                          fontSize: '0.85rem'
+                        }}
+                        title="削除"
+                      >
+                        🗑️
+                      </button>
                     </div>
-                    <button
-                      onClick={(e) => deleteProject(e, project.id, project.name)}
-                      style={{
-                        padding: '6px 10px',
-                        background: '#fee2e2',
-                        border: 'none',
-                        borderRadius: '6px',
-                        color: '#dc2626',
-                        cursor: 'pointer',
-                        fontSize: '0.85rem'
-                      }}
-                      title="削除"
-                    >
-                      🗑️
-                    </button>
-                  </div>
-                </li>
-              ))}
-            </ul>
+                  </li>
+                ))}
+              </ul>
+            </div>
           )}
         </div>
       </div>
@@ -452,6 +720,136 @@ function HomePage() {
                 ))}
               </ul>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* User Management Modal (admin only) */}
+      {showUserModal && isAdmin && (
+        <div style={{
+          position: 'fixed',
+          top: 0, left: 0, right: 0, bottom: 0,
+          background: 'rgba(0,0,0,0.5)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1000
+        }}>
+          <div style={{
+            background: 'white',
+            borderRadius: '12px',
+            padding: '24px',
+            maxWidth: '600px',
+            width: '95%',
+            maxHeight: '80vh',
+            overflow: 'auto'
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+              <h3 style={{ margin: 0 }}>ユーザー管理</h3>
+              <button
+                onClick={() => setShowUserModal(false)}
+                style={{ background: 'none', border: 'none', fontSize: '1.5rem', cursor: 'pointer' }}
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* New User Form */}
+            <div style={{
+              padding: '16px',
+              background: '#f8f9fa',
+              borderRadius: '8px',
+              marginBottom: '20px'
+            }}>
+              <h4 style={{ margin: '0 0 12px 0', fontSize: '0.95rem' }}>新規ユーザー</h4>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '10px' }}>
+                <input
+                  type="text"
+                  placeholder="ユーザー名 *"
+                  value={newUsername}
+                  onChange={(e) => setNewUsername(e.target.value)}
+                  style={{ padding: '8px 12px', border: '1px solid #ddd', borderRadius: '6px', fontSize: '0.9rem' }}
+                />
+                <input
+                  type="password"
+                  placeholder="パスワード *"
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  style={{ padding: '8px 12px', border: '1px solid #ddd', borderRadius: '6px', fontSize: '0.9rem' }}
+                />
+                <input
+                  type="text"
+                  placeholder="表示名"
+                  value={newDisplayName}
+                  onChange={(e) => setNewDisplayName(e.target.value)}
+                  style={{ padding: '8px 12px', border: '1px solid #ddd', borderRadius: '6px', fontSize: '0.9rem' }}
+                />
+                <select
+                  value={newRole}
+                  onChange={(e) => setNewRole(e.target.value)}
+                  style={{ padding: '8px 12px', border: '1px solid #ddd', borderRadius: '6px', fontSize: '0.9rem' }}
+                >
+                  <option value="user">一般ユーザー</option>
+                  <option value="admin">管理者</option>
+                </select>
+              </div>
+              <button
+                onClick={createUser}
+                disabled={userLoading || !newUsername || !newPassword}
+                className="btn btn-primary"
+                style={{ fontSize: '0.85rem', padding: '8px 20px' }}
+              >
+                {userLoading ? '作成中...' : '作成'}
+              </button>
+            </div>
+
+            {/* User List */}
+            <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+              {users.map((user) => (
+                <li key={user.id} style={{
+                  padding: '12px 16px',
+                  borderBottom: '1px solid #eee',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center'
+                }}>
+                  <div>
+                    <div style={{ fontWeight: '500' }}>
+                      {user.display_name || user.username}
+                      <span style={{
+                        marginLeft: '8px',
+                        padding: '2px 8px',
+                        background: user.role === 'admin' ? '#667eea' : '#e2e8f0',
+                        color: user.role === 'admin' ? 'white' : '#666',
+                        borderRadius: '10px',
+                        fontSize: '0.75rem'
+                      }}>
+                        {user.role === 'admin' ? '管理者' : 'ユーザー'}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: '0.8rem', color: '#888', marginTop: '2px' }}>
+                      @{user.username} · プロジェクト {user.projectCount || 0}件
+                    </div>
+                  </div>
+                  {user.id !== currentUser?.userId && (
+                    <button
+                      onClick={() => deleteUser(user.id, user.display_name || user.username)}
+                      style={{
+                        padding: '4px 10px',
+                        background: '#fee2e2',
+                        border: 'none',
+                        borderRadius: '6px',
+                        color: '#dc2626',
+                        cursor: 'pointer',
+                        fontSize: '0.8rem'
+                      }}
+                    >
+                      削除
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
           </div>
         </div>
       )}

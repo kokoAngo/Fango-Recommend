@@ -1,6 +1,7 @@
 import puppeteer from 'puppeteer';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import fs from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,6 +18,34 @@ const SCREENSHOT_DIR = path.join(__dirname, 'screenshots');
 
 let browser = null;
 let page = null;
+let browserLock = false;
+let lockQueue = [];
+
+/**
+ * Acquire browser lock to prevent concurrent access
+ */
+async function acquireLock() {
+  if (!browserLock) {
+    browserLock = true;
+    return;
+  }
+  // Wait in queue
+  return new Promise((resolve) => {
+    lockQueue.push(resolve);
+  });
+}
+
+/**
+ * Release browser lock
+ */
+function releaseLock() {
+  if (lockQueue.length > 0) {
+    const next = lockQueue.shift();
+    next();
+  } else {
+    browserLock = false;
+  }
+}
 
 /**
  * Save screenshot for debugging
@@ -36,25 +65,73 @@ async function saveScreenshot(name) {
 }
 
 /**
- * Initialize browser and login to SUUMO JDS
+ * Force close browser and reset state (internal use)
  */
-async function initBrowser() {
+async function resetBrowser() {
   if (browser) {
     try {
-      await browser.pages();
+      await browser.close();
+    } catch (e) {
+      // Ignore close errors
+    }
+  }
+  browser = null;
+  page = null;
+}
+
+/**
+ * Initialize browser and login to SUUMO JDS
+ */
+async function initBrowser(forceNew = false) {
+  // Force new browser if requested
+  if (forceNew) {
+    await resetBrowser();
+  }
+
+  // Check if browser and page are still valid
+  if (browser && page) {
+    try {
+      // Test if page is still usable
+      await page.evaluate(() => true);
       return;
     } catch (e) {
-      browser = null;
-      page = null;
+      console.log('[SUUMO] Browser session expired, recreating...');
+      await resetBrowser();
     }
   }
 
   console.log('[SUUMO] Launching browser...');
-  browser = await puppeteer.launch({
+
+  // Find Chrome executable path - prefer system Chrome for stability
+  const possiblePaths = [
+    // System Chrome installations (more stable)
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    // Puppeteer cache locations
+    path.join(process.env.USERPROFILE || '', '.cache', 'puppeteer', 'chrome', 'win64-144.0.7559.96', 'chrome-win64', 'chrome.exe'),
+    path.join(process.env.USERPROFILE || '', '.cache', 'puppeteer', 'chrome', 'win64-121.0.6167.85', 'chrome-win64', 'chrome.exe'),
+  ];
+
+  let executablePath = null;
+  for (const p of possiblePaths) {
+    if (fs.existsSync(p)) {
+      executablePath = p;
+      console.log('[SUUMO] Found Chrome at:', executablePath);
+      break;
+    }
+  }
+
+  const launchOptions = {
     headless: false,  // Show browser for debugging
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
     defaultViewport: null
-  });
+  };
+
+  if (executablePath) {
+    launchOptions.executablePath = executablePath;
+  }
+
+  browser = await puppeteer.launch(launchOptions);
   page = await browser.newPage();
 
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
@@ -345,6 +422,7 @@ function buildRequirementsFromDetails(details) {
     email: details['メールアドレス'] || '',
     phone: details['ＴＥＬ'] || '',
     inquiry: details['お問合せ内容'] || '',
+    inquiryDate: details['お問合せ日時'] || '', // e.g., "2026/1/28 10:21:05"
     requirements: requirements.join('\n'),
     rawDetails: details
   };
@@ -354,15 +432,38 @@ function buildRequirementsFromDetails(details) {
  * Main function to get all customers
  */
 export async function getCustomerList() {
+  await acquireLock();
+  console.log('[SUUMO] Lock acquired for getCustomerList');
   try {
-    await login();
-    await navigateToFeedbackAndSearch();
-    const customers = await extractCustomerList();
-    return customers;
-  } catch (error) {
-    console.error('[SUUMO] Error getting customer list:', error.message);
-    await saveScreenshot('error_customer_list');
-    throw error;
+    // First attempt
+    try {
+      await login();
+      await navigateToFeedbackAndSearch();
+      const customers = await extractCustomerList();
+      return customers;
+    } catch (error) {
+      // Check if it's a detached frame error - if so, retry with fresh browser
+      if (error.message.includes('detached') || error.message.includes('Session closed')) {
+        console.log('[SUUMO] Detached frame error, retrying with fresh browser...');
+        try {
+          await initBrowser(true); // Force new browser
+          await login();
+          await navigateToFeedbackAndSearch();
+          const customers = await extractCustomerList();
+          return customers;
+        } catch (retryError) {
+          console.error('[SUUMO] Retry failed:', retryError.message);
+          await saveScreenshot('error_customer_list_retry');
+          throw retryError;
+        }
+      }
+      console.error('[SUUMO] Error getting customer list:', error.message);
+      await saveScreenshot('error_customer_list');
+      throw error;
+    }
+  } finally {
+    releaseLock();
+    console.log('[SUUMO] Lock released for getCustomerList');
   }
 }
 
@@ -371,7 +472,10 @@ export async function getCustomerList() {
  * Navigates to detail page and extracts full information
  */
 export async function getCustomerRequirements(customerId, customerData) {
-  try {
+  await acquireLock();
+  console.log(`[SUUMO] Lock acquired for getCustomerRequirements (${customerId})`);
+
+  async function fetchDetails() {
     // Make sure we're logged in and on the search results page
     await login();
     await navigateToFeedbackAndSearch();
@@ -400,10 +504,32 @@ export async function getCustomerRequirements(customerId, customerData) {
         requirements: requirements.join('\n')
       };
     }
-  } catch (error) {
-    console.error('[SUUMO] Error getting customer requirements:', error.message);
-    await saveScreenshot('error_get_requirements');
-    throw error;
+  }
+
+  try {
+    // First attempt
+    try {
+      return await fetchDetails();
+    } catch (error) {
+      // Check if it's a detached frame error - if so, retry with fresh browser
+      if (error.message.includes('detached') || error.message.includes('Session closed')) {
+        console.log('[SUUMO] Detached frame error, retrying with fresh browser...');
+        try {
+          await initBrowser(true); // Force new browser
+          return await fetchDetails();
+        } catch (retryError) {
+          console.error('[SUUMO] Retry failed:', retryError.message);
+          await saveScreenshot('error_get_requirements_retry');
+          throw retryError;
+        }
+      }
+      console.error('[SUUMO] Error getting customer requirements:', error.message);
+      await saveScreenshot('error_get_requirements');
+      throw error;
+    }
+  } finally {
+    releaseLock();
+    console.log(`[SUUMO] Lock released for getCustomerRequirements (${customerId})`);
   }
 }
 
